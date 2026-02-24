@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Тег релиза (например: v1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install pyinstaller pillow
+
+      - name: Generate icon
+        shell: python
+        run: |
+          from PIL import Image, ImageDraw
+
+          def make_icon(size):
+              img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+              d = ImageDraw.Draw(img)
+              cx = cy = size // 2
+              pad = size // 7
+              d.ellipse([pad, pad, size-pad, size-pad], fill=(13, 13, 32, 255))
+              d.ellipse([pad-2, pad-2, size-pad+2, size-pad+2],
+                        outline=(25, 25, 55, 160), width=max(1, size // 48))
+              r = int(size * 0.27)
+              box = [cx-r, cy-r, cx+r, cy+r]
+              lw = max(1, size // 18)
+              d.arc(box, start=307, end=593, fill=(50, 50, 95, 255), width=lw)
+              d.line([cx, cy - r - lw, cx, cy - r // 2],
+                     fill=(50, 50, 95, 255), width=lw)
+              return img
+
+          sizes = [16, 24, 32, 48, 64, 128, 256]
+          imgs = [make_icon(s) for s in sizes]
+          imgs[0].save('z2w.ico', format='ICO', append_images=imgs[1:])
+          print('Icon created: z2w.ico')
+
+      - name: Build z2w.exe
+        run: >
+          pyinstaller
+          --onefile
+          --windowed
+          --uac-admin
+          --name z2w
+          --icon z2w.ico
+          z2k_gui.py
+
+      - name: Package release
+        shell: pwsh
+        run: |
+          $out = New-Item -ItemType Directory "z2w-release" -Force
+          $skip = @('z2k_gui.py', 'z2w.ico', 'z2w.spec', 'build', 'dist',
+                    '__pycache__', '.github', '.gitignore', 'README.md')
+
+          Get-ChildItem . |
+            Where-Object { $_.Name -notin $skip } |
+            ForEach-Object { Copy-Item $_.FullName "$out\" -Recurse -Force }
+
+          Copy-Item dist\z2w.exe "$out\z2w.exe" -Force
+
+          Compress-Archive -Path "$out\*" -DestinationPath z2w.zip
+
+          $mb = [math]::Round((Get-Item z2w.zip).Length / 1MB, 1)
+          Write-Host "z2w.zip — $mb MB"
+          Get-ChildItem $out -Recurse | Select-Object -ExpandProperty FullName
+
+      - name: Determine tag
+        id: rel
+        shell: pwsh
+        run: |
+          $t = if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            "${{ inputs.tag }}"
+          } else {
+            "${{ github.ref_name }}"
+          }
+          "tag=$t" >> $env:GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.rel.outputs.tag }}
+          name: "z2w ${{ steps.rel.outputs.tag }}"
+          files: |
+            z2w.zip
+            dist/z2w.exe
+          body: |
+            ## Установка
+
+            1. Скачай **`z2w.zip`** и распакуй в любую папку
+            2. Запусти **`z2w.exe`** — права администратора запросятся автоматически
+            3. Нажми кнопку питания для включения обхода
+
+            > Обходит блокировки РКН, YouTube, Discord (включая голос)
