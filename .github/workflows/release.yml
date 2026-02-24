@@ -102,9 +102,7 @@ jobs:
         with:
           tag_name: ${{ steps.rel.outputs.tag }}
           name: "z2w ${{ steps.rel.outputs.tag }}"
-          files: |
-            z2w.zip
-            dist/z2w.exe
+          files: z2w.zip
           body: |
             ## Установка
 
