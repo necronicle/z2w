@@ -181,8 +181,7 @@ class App:
             fill=ICON_OFF, width=3, capstyle="round", tags="btn"
         )
 
-        # Привязка событий
-        cv.tag_bind("btn", "<Button-1>", self._toggle)
+        # Привязка событий (только canvas.bind — tag_bind + canvas.bind вызвали бы toggle дважды)
         cv.bind("<Button-1>", self._toggle)
         cv.tag_bind("btn", "<Enter>", lambda e: cv.config(cursor="hand2"))
         cv.tag_bind("btn", "<Leave>", lambda e: cv.config(cursor=""))
@@ -240,7 +239,7 @@ class App:
                 [WINWS_EXE] + args,
                 cwd=SCRIPT_DIR,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
         except FileNotFoundError as e:
@@ -271,12 +270,23 @@ class App:
 
     def _watch_process(self):
         """Фоновый поток: следит за неожиданным завершением winws2."""
-        if self.process:
-            self.process.wait()
-        if self.running:
-            self.running = False
-            self.process = None
-            self.root.after(0, self._refresh_visuals)
+        proc = self.process
+        if proc:
+            proc.wait()
+            stderr_data = b""
+            try:
+                stderr_data = proc.stderr.read()
+            except Exception:
+                pass
+            if self.running:
+                self.running = False
+                self.process = None
+                msg = stderr_data.decode("utf-8", errors="replace").strip()[-300:] if stderr_data else ""
+                self.root.after(0, lambda m=msg: self._on_crash(m))
+
+    def _on_crash(self, msg: str):
+        self._refresh_visuals()
+        self._err_var.set(f"winws2 упал: {msg}" if msg else "winws2 завершился неожиданно")
 
     # ── Визуализация ─────────────────────────────────────────────────────────
 
