@@ -71,11 +71,12 @@ jobs:
         run: |
           $out = New-Item -ItemType Directory "z2w-release" -Force
           $skip = @('z2k_gui.py', 'z2w.ico', 'z2w.spec', 'build', 'dist',
-                    '__pycache__', '.github', '.gitignore', 'README.md')
+                    '__pycache__', '.github', '.gitignore', 'README.md',
+                    'z2w-release', 'z2w.zip')
 
           Get-ChildItem . |
             Where-Object { $_.Name -notin $skip } |
-            ForEach-Object { Copy-Item $_.FullName "$out\" -Recurse -Force }
+            ForEach-Object { Copy-Item $_.FullName $out.FullName -Recurse -Force }
 
           Copy-Item dist\z2w.exe "$out\z2w.exe" -Force
 
