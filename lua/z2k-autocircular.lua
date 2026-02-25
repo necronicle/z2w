@@ -28,12 +28,15 @@ local telemetry = {} -- telemetry[askey][hostn][strategy] = { ok, fail, lat, ts,
 
 local last_write = 0
 local write_interval = 2 -- seconds
+local pending_write = false
 local last_telemetry_write = 0
 local telemetry_write_interval = 5 -- seconds
 
 local debug_enabled = false
 local debug_checked_at = 0
 local debug_refresh_interval = 5 -- seconds
+
+math.randomseed(os.time() or 0)
 
 local policy_enabled = true
 local policy_epsilon = 0.15
@@ -193,12 +196,10 @@ local function load_state()
   for line in f:lines() do
     if line ~= "" and not line:match("^%s*#") then
       local askey, host, strat, ts = line:match("^([^\t]+)\t([^\t]+)\t([0-9]+)\t?([0-9]*)")
-      if askey and host and strat then
-        local n = tonumber(strat)
-        -- Do not keep default strategy "1" on disk. It is the implicit default anyway.
-        if n and n >= 2 then
-          local hn = normalize_hostkey_for_state(host)
-          if hn then
+              if askey and host and strat then
+                local n = tonumber(strat)
+                if n and n >= 1 then
+                  local hn = normalize_hostkey_for_state(host)          if hn then
             if not state[askey] then state[askey] = {} end
             state[askey][hn] = { strategy = n, ts = tonumber(ts) or 0 }
           end
@@ -213,13 +214,43 @@ end
 local function write_state()
   local now = os.time() or 0
   if now ~= 0 and (now - last_write) < write_interval then
+    pending_write = true
     return
   end
   last_write = now
+  pending_write = false
 
   local path = choose_state_file_for_write()
   if not path then return end
   local tmp = path .. ".tmp"
+
+  -- Read existing file to merge state (prevents split-brain across processes)
+  local merged_state = {}
+  local f_in = io.open(path, "r")
+  if f_in then
+    for line in f_in:lines() do
+      if line ~= "" and not line:match("^%s*#") then
+        local askey, host, strat, ts = line:match("^([^\t]+)\t([^\t]+)\t([0-9]+)\t?([0-9]*)")
+        if askey and host and strat then
+          if not merged_state[askey] then merged_state[askey] = {} end
+          merged_state[askey][host] = { strategy = tonumber(strat), ts = tonumber(ts) or 0 }
+        end
+      end
+    end
+    f_in:close()
+  end
+
+  -- Apply our in-memory state over the merged state
+  for askey, hosts in pairs(state) do
+    if not merged_state[askey] then merged_state[askey] = {} end
+    for hostn, rec in pairs(hosts) do
+      if rec.deleted then
+        merged_state[askey][hostn] = nil
+      else
+        merged_state[askey][hostn] = rec
+      end
+    end
+  end
 
   local f = io.open(tmp, "w")
   if not f then return end
@@ -227,7 +258,7 @@ local function write_state()
   f:write("# z2k autocircular state (persisted circular nstrategy)\n")
   f:write("# key\thost\tstrategy\tts\n")
 
-  for askey, hosts in pairs(state) do
+  for askey, hosts in pairs(merged_state) do
     for hostn, rec in pairs(hosts) do
       if rec and rec.strategy then
         f:write(tostring(askey), "\t", tostring(hostn), "\t", tostring(rec.strategy), "\t", tostring(rec.ts or 0), "\n")
@@ -527,8 +558,8 @@ end
 local function clear_persisted(askey, hostn)
   if not askey or not hostn then return end
   if state[askey] and state[askey][hostn] then
-    state[askey][hostn] = nil
-    if next(state[askey]) == nil then state[askey] = nil end
+    -- Mark as deleted instead of nil to propagate deletion during merge
+    state[askey][hostn] = { deleted = true, ts = os.time() or 0 }
     write_state()
   end
 end
@@ -537,12 +568,6 @@ local function persist_if_changed(askey, hostn, hrec)
   if not askey or not hostn or not hrec or not hrec.nstrategy then return false end
   local n = tonumber(hrec.nstrategy)
   if not n or n < 1 then return false end
-
-  -- Strategy "1" is default. Do not overwrite or delete stored state with it:
-  -- keep the last known successful non-default strategy so restarts don't "forget" it.
-  if n == 1 then
-    return false
-  end
 
   local prev = state[askey] and state[askey][hostn] and state[askey][hostn].strategy or nil
   if prev == n then return false end
@@ -786,6 +811,10 @@ if type(circular) == "function" then
         if strat_for_stat then
           telemetry_record_event(askey, hostn, strat_for_stat, success_event and (not failure_event), latency_s, now_f())
         end
+      end
+
+      if pending_write then
+        write_state()
       end
 
       local debug_event = persisted or failure_after or success_event or failure_event or (policy_pick_before ~= nil)

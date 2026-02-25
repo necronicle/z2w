@@ -3,6 +3,8 @@
 -- 1) custom 3-fragment IP fragmenters (with optional overlap)
 -- 2) TLS ClientHello extension-order morphing (fingerprint drift)
 
+math.randomseed(os.time() or 0)
+
 local function z2k_num(v, fallback)
     local n = tonumber(v)
     if n == nil then return fallback end
@@ -427,12 +429,8 @@ local function z2k_quic_morph_payload(payload, arg)
                     table.insert(b, token_pos + i - 1, math.random(0, 255))
                 end
 
-                -- Best-effort packet length varint correction (only 1-byte encoding).
-                local plen_pos = token_pos + token_fill_len
-                local plen, plen_vlen = z2k_qvarint_decode_bytes(b, plen_pos, #b)
-                if plen and plen_vlen == 1 and plen <= (63 - token_fill_len) then
-                    b[plen_pos] = plen + token_fill_len
-                end
+                -- Token expanded; QUIC Initial Length field does NOT need adjustment
+                -- because it only covers Packet Number and Payload lengths.
             end
         end
     end
@@ -601,6 +599,7 @@ end
 --   cs_keep_head=3                     ; keep first N cipher suites fixed
 --   groups_keep_head=1                 ; keep first N supported groups fixed
 --   alpn_chance=50                     ; chance (%) to shuffle ALPN order
+--   pad_min=0 pad_max=0                ; add TLS Padding extension (type 21) with random length
 function z2k_tls_fp_pack_v2(ctx, desync)
     if not desync or not desync.dis or not desync.dis.tcp then
         return
@@ -620,6 +619,19 @@ function z2k_tls_fp_pack_v2(ctx, desync)
     end
 
     local changed = false
+
+    local pad_min = z2k_clamp(arg.pad_min, 0, 2000, 0)
+    local pad_max = z2k_clamp(arg.pad_max, 0, 2000, 0)
+    local pad_len = z2k_rand_between(pad_min, pad_max)
+    if type(ch.ext) == "table" and pad_len > 0 then
+        -- Add TLS Padding extension (type 21)
+        table.insert(ch.ext, {
+            type = 21,
+            len = pad_len,
+            data = string.rep("\0", pad_len)
+        })
+        changed = true
+    end
 
     if type(ch.ext) == "table" and #ch.ext >= 4 then
         local movable_idx = {}
