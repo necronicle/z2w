@@ -47,6 +47,10 @@ BASE_ARGS = [
     "--blob=tls_clienthello_4pda_to:files/tls_clienthello_4pda_to.bin",
     "--blob=tls_clienthello_vk_com:files/tls_clienthello_vk_com.bin",
     "--blob=tls_clienthello_www_google_com:files/tls_clienthello_www_google_com.bin",
+    "--blob=tls_clienthello_activated:files/tls_clienthello_activated.bin",
+    "--blob=tls_clienthello_gosuslugi_ru:files/tls_clienthello_gosuslugi_ru.bin",
+    "--blob=tls_clienthello_www_onetrust_com:files/tls_clienthello_www_onetrust_com.bin",
+    "--blob=t2:files/t2.bin",
     "--wf-raw-part=@windivert.filter/windivert_part.discord_media.txt",
     "--wf-raw-part=@windivert.filter/windivert_part.stun.txt",
     "--wf-raw-part=@windivert.filter/windivert_part.wireguard.txt",
@@ -233,6 +237,7 @@ class App:
     def _start(self):
         self._err_var.set("")
         try:
+            os.makedirs(os.path.join(SCRIPT_DIR, "cache", "autocircular"), exist_ok=True)
             self._unblock_files()
             args = self._build_args()
             self.process = subprocess.Popen(

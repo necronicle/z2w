@@ -11,15 +11,15 @@
 -- - We do NOT change rotation logic; only persist/restore.
 -- - Storage key uses `desync.arg.key` when provided; otherwise falls back to `desync.func_instance`.
 
-local STATE_DIR_PRIMARY = "/opt/zapret2/extra_strats/cache/autocircular"
+local STATE_DIR_PRIMARY = "cache/autocircular"
 local STATE_FILE_PRIMARY = STATE_DIR_PRIMARY .. "/state.tsv"
-local STATE_FILE_FALLBACK = "/tmp/z2k-autocircular-state.tsv"
+local STATE_FILE_FALLBACK = (os.getenv("TEMP") or ".") .. "/z2k-autocircular-state.tsv"
 local TELEMETRY_FILE_PRIMARY = STATE_DIR_PRIMARY .. "/telemetry.tsv"
-local TELEMETRY_FILE_FALLBACK = "/tmp/z2k-autocircular-telemetry.tsv"
+local TELEMETRY_FILE_FALLBACK = (os.getenv("TEMP") or ".") .. "/z2k-autocircular-telemetry.tsv"
 local DEBUG_FLAG_PRIMARY = STATE_DIR_PRIMARY .. "/debug.flag"
-local DEBUG_FLAG_FALLBACK = "/tmp/z2k-autocircular-debug.flag"
+local DEBUG_FLAG_FALLBACK = (os.getenv("TEMP") or ".") .. "/z2k-autocircular-debug.flag"
 local DEBUG_LOG_PRIMARY = STATE_DIR_PRIMARY .. "/debug.log"
-local DEBUG_LOG_FALLBACK = "/tmp/z2k-autocircular-debug.log"
+local DEBUG_LOG_FALLBACK = (os.getenv("TEMP") or ".") .. "/z2k-autocircular-debug.log"
 
 local loaded = false
 local state = {} -- state[askey][host_norm] = { strategy = N, ts = unix_time }
@@ -66,11 +66,50 @@ local function normalize_hostkey_for_state(hostkey)
   return string.lower(s)
 end
 
+local function can_read_file(path)
+  local f = io.open(path, "r")
+  if not f then return false end
+  f:close()
+  return true
+end
+
+local function can_append_existing_file(path)
+  if not can_read_file(path) then return false end
+  local f = io.open(path, "a")
+  if not f then return false end
+  f:close()
+  return true
+end
+
+local function can_replace_file_via_parent_dir(path)
+  if is_blank(path) then return false end
+  local dir = tostring(path):match("^(.*)[/\\][^/\\]+$")
+  if is_blank(dir) then return false end
+
+  local probe = string.format(
+    "%s/.z2k-write-probe-%d-%d.tmp",
+    dir,
+    tonumber(os.time() or 0) or 0,
+    math.random(100000, 999999)
+  )
+
+  local f = io.open(probe, "w")
+  if not f then return false end
+  f:close()
+  os.remove(probe)
+  return true
+end
+
 local function choose_state_file_for_read()
-  local f = io.open(STATE_FILE_PRIMARY, "r")
-  if f then f:close(); return STATE_FILE_PRIMARY end
-  f = io.open(STATE_FILE_FALLBACK, "r")
-  if f then f:close(); return STATE_FILE_FALLBACK end
+  if can_append_existing_file(STATE_FILE_PRIMARY) then
+    return STATE_FILE_PRIMARY
+  end
+  if can_read_file(STATE_FILE_FALLBACK) then
+    return STATE_FILE_FALLBACK
+  end
+  if can_read_file(STATE_FILE_PRIMARY) then
+    return STATE_FILE_PRIMARY
+  end
   return nil
 end
 
@@ -126,24 +165,54 @@ local function create_empty_state_file(path)
 end
 
 local function choose_state_file_for_write()
-  local f = io.open(STATE_FILE_PRIMARY, "a")
-  if f then f:close(); return STATE_FILE_PRIMARY end
-  f = io.open(STATE_FILE_FALLBACK, "a")
-  if f then f:close(); return STATE_FILE_FALLBACK end
+  if can_append_existing_file(STATE_FILE_PRIMARY) then
+    return STATE_FILE_PRIMARY
+  end
+  if can_replace_file_via_parent_dir(STATE_FILE_PRIMARY) then
+    return STATE_FILE_PRIMARY
+  end
+  if can_append_existing_file(STATE_FILE_FALLBACK) then
+    return STATE_FILE_FALLBACK
+  end
+  if can_replace_file_via_parent_dir(STATE_FILE_FALLBACK) then
+    return STATE_FILE_FALLBACK
+  end
+  if create_empty_state_file(STATE_FILE_FALLBACK) then
+    return STATE_FILE_FALLBACK
+  end
   return nil
 end
 
 local function ensure_state_file_exists()
-  local existing = choose_state_file_for_read()
-  if existing then return existing end
+  return choose_state_file_for_read()
+end
 
-  local writable = choose_state_file_for_write()
-  if not writable then return nil end
+local function merge_state_file_into(path, dest)
+  if not path or not dest then return end
+  local f = io.open(path, "r")
+  if not f then return end
 
-  if create_empty_state_file(writable) then
-    return writable
+  for line in f:lines() do
+    if line ~= "" and not line:match("^%s*#") then
+      local askey, host, strat, ts = line:match("^([^\t]+)\t([^\t]+)\t([0-9]+)\t?([0-9]*)")
+      if askey and host and strat then
+        local n = tonumber(strat)
+        if n and n >= 1 then
+          local hn = normalize_hostkey_for_state(host)
+          if hn then
+            if not dest[askey] then dest[askey] = {} end
+            local tsn = tonumber(ts) or 0
+            local prev = dest[askey][hn]
+            if (not prev) or ((tonumber(prev.ts) or 0) <= tsn) then
+              dest[askey][hn] = { strategy = n, ts = tsn }
+            end
+          end
+        end
+      end
+    end
   end
-  return nil
+
+  f:close()
 end
 
 local function create_empty_telemetry_file(path)
@@ -156,30 +225,74 @@ local function create_empty_telemetry_file(path)
 end
 
 local function choose_telemetry_file_for_read()
-  local f = io.open(TELEMETRY_FILE_PRIMARY, "r")
-  if f then f:close(); return TELEMETRY_FILE_PRIMARY end
-  f = io.open(TELEMETRY_FILE_FALLBACK, "r")
-  if f then f:close(); return TELEMETRY_FILE_FALLBACK end
+  if can_append_existing_file(TELEMETRY_FILE_PRIMARY) then
+    return TELEMETRY_FILE_PRIMARY
+  end
+  if can_read_file(TELEMETRY_FILE_FALLBACK) then
+    return TELEMETRY_FILE_FALLBACK
+  end
+  if can_read_file(TELEMETRY_FILE_PRIMARY) then
+    return TELEMETRY_FILE_PRIMARY
+  end
   return nil
 end
 
 local function choose_telemetry_file_for_write()
-  local f = io.open(TELEMETRY_FILE_PRIMARY, "a")
-  if f then f:close(); return TELEMETRY_FILE_PRIMARY end
-  f = io.open(TELEMETRY_FILE_FALLBACK, "a")
-  if f then f:close(); return TELEMETRY_FILE_FALLBACK end
+  if can_append_existing_file(TELEMETRY_FILE_PRIMARY) then
+    return TELEMETRY_FILE_PRIMARY
+  end
+  if can_replace_file_via_parent_dir(TELEMETRY_FILE_PRIMARY) then
+    return TELEMETRY_FILE_PRIMARY
+  end
+  if can_append_existing_file(TELEMETRY_FILE_FALLBACK) then
+    return TELEMETRY_FILE_FALLBACK
+  end
+  if can_replace_file_via_parent_dir(TELEMETRY_FILE_FALLBACK) then
+    return TELEMETRY_FILE_FALLBACK
+  end
+  if create_empty_telemetry_file(TELEMETRY_FILE_FALLBACK) then
+    return TELEMETRY_FILE_FALLBACK
+  end
   return nil
 end
 
 local function ensure_telemetry_file_exists()
-  local existing = choose_telemetry_file_for_read()
-  if existing then return existing end
-  local writable = choose_telemetry_file_for_write()
-  if not writable then return nil end
-  if create_empty_telemetry_file(writable) then
-    return writable
+  return choose_telemetry_file_for_read()
+end
+
+local function merge_telemetry_file_into(path, dest)
+  if not path or not dest then return end
+  local f = io.open(path, "r")
+  if not f then return end
+
+  for line in f:lines() do
+    if line ~= "" and not line:match("^%s*#") then
+      local askey, hostn, strat, okv, failv, latv, tsv, cdv =
+        line:match("^([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]*)\t?([^\t]*)")
+      local s = tonumber(strat)
+      if askey and hostn and s and s >= 1 then
+        if not dest[askey] then dest[askey] = {} end
+        if not dest[askey][hostn] then dest[askey][hostn] = {} end
+        local next_rec = {
+          ok = tonumber(okv) or 0,
+          fail = tonumber(failv) or 0,
+          lat = tonumber(latv) or 0,
+          ts = tonumber(tsv) or 0,
+          cooldown_until = tonumber(cdv) or 0,
+        }
+        local prev = dest[askey][hostn][s]
+        local prev_ts = prev and (tonumber(prev.ts) or 0) or -1
+        local next_ts = tonumber(next_rec.ts) or 0
+        local prev_cd = prev and (tonumber(prev.cooldown_until) or 0) or -1
+        local next_cd = tonumber(next_rec.cooldown_until) or 0
+        if (not prev) or (next_ts > prev_ts) or (next_ts == prev_ts and next_cd >= prev_cd) then
+          dest[askey][hostn][s] = next_rec
+        end
+      end
+    end
   end
-  return nil
+
+  f:close()
 end
 
 local function load_state()
@@ -190,25 +303,92 @@ local function load_state()
   local path = ensure_state_file_exists()
   if not path then return end
 
-  local f = io.open(path, "r")
-  if not f then return end
+  merge_state_file_into(STATE_FILE_PRIMARY, state)
+  merge_state_file_into(STATE_FILE_FALLBACK, state)
+end
 
-  for line in f:lines() do
-    if line ~= "" and not line:match("^%s*#") then
-      local askey, host, strat, ts = line:match("^([^\t]+)\t([^\t]+)\t([0-9]+)\t?([0-9]*)")
-              if askey and host and strat then
-                local n = tonumber(strat)
-                if n and n >= 1 then
-                  local hn = normalize_hostkey_for_state(host)          if hn then
-            if not state[askey] then state[askey] = {} end
-            state[askey][hn] = { strategy = n, ts = tonumber(ts) or 0 }
-          end
-        end
+local MAX_ENTRIES_PER_KEY = 500
+
+local function evict_state_entries(merged)
+  for askey, hosts in pairs(merged) do
+    local count = 0
+    for _ in pairs(hosts) do count = count + 1 end
+    if count > MAX_ENTRIES_PER_KEY then
+      -- Collect entries with timestamps, sort by ts ascending, remove oldest
+      local entries = {}
+      for hostn, rec in pairs(hosts) do
+        table.insert(entries, { hostn = hostn, ts = (rec and rec.ts) or 0 })
+      end
+      table.sort(entries, function(a, b) return a.ts < b.ts end)
+      local to_remove = count - MAX_ENTRIES_PER_KEY
+      for i = 1, to_remove do
+        hosts[entries[i].hostn] = nil
       end
     end
   end
+end
 
-  f:close()
+local function evict_telemetry_entries(merged)
+  for askey, hosts in pairs(merged) do
+    local count = 0
+    for _ in pairs(hosts) do count = count + 1 end
+    if count > MAX_ENTRIES_PER_KEY then
+      -- Collect entries with total attempts, sort by att ascending, remove lowest
+      local entries = {}
+      for hostn, strats in pairs(hosts) do
+        local att = 0
+        if type(strats) == "table" then
+          for _, rec in pairs(strats) do
+            if rec then
+              att = att + (tonumber(rec.ok) or 0) + (tonumber(rec.fail) or 0)
+            end
+          end
+        end
+        table.insert(entries, { hostn = hostn, att = att })
+      end
+      table.sort(entries, function(a, b) return a.att < b.att end)
+      local to_remove = count - MAX_ENTRIES_PER_KEY
+      for i = 1, to_remove do
+        hosts[entries[i].hostn] = nil
+      end
+    end
+  end
+end
+
+local function acquire_lock(path)
+  local lockfile = path .. ".lock"
+  -- Check for stale lock (older than 10 seconds)
+  local lf_ts = io.open(lockfile, "r")
+  if lf_ts then
+    local content = lf_ts:read("*a")
+    lf_ts:close()
+    local lock_time = tonumber(content)
+    if lock_time and ((os.time() or 0) - lock_time) > 10 then
+      os.remove(lockfile)
+    else
+      return nil, lockfile -- lock is fresh, another process holds it
+    end
+  end
+  -- Try exclusive create: "wx" works in Lua 5.3+/glibc; fallback to "w" with
+  -- prior existence check (not perfectly atomic but good enough for our use case).
+  local lf = io.open(lockfile, "wx")
+  if not lf then
+    -- "wx" not supported or file appeared between check and open
+    local recheck = io.open(lockfile, "r")
+    if recheck then
+      recheck:close()
+      return nil, lockfile -- another process created it
+    end
+    lf = io.open(lockfile, "w")
+  end
+  if not lf then return nil, lockfile end
+  lf:write(tostring(os.time() or 0))
+  lf:close()
+  return true, lockfile
+end
+
+local function release_lock(lockfile)
+  if lockfile then os.remove(lockfile) end
 end
 
 local function write_state()
@@ -221,7 +401,18 @@ local function write_state()
   pending_write = false
 
   local path = choose_state_file_for_write()
-  if not path then return end
+  if not path then
+    pending_write = true
+    return
+  end
+
+  -- Acquire lock to prevent concurrent writes
+  local locked, lockfile = acquire_lock(path)
+  if not locked then
+    pending_write = true
+    return
+  end -- another process is writing, skip this cycle
+
   local tmp = path .. ".tmp"
 
   -- Read existing file to merge state (prevents split-brain across processes)
@@ -252,8 +443,15 @@ local function write_state()
     end
   end
 
+  -- Evict oldest entries if any key exceeds MAX_ENTRIES_PER_KEY
+  evict_state_entries(merged_state)
+
   local f = io.open(tmp, "w")
-  if not f then return end
+  if not f then
+    pending_write = true
+    release_lock(lockfile)
+    return
+  end
 
   f:write("# z2k autocircular state (persisted circular nstrategy)\n")
   f:write("# key\thost\tstrategy\tts\n")
@@ -267,7 +465,14 @@ local function write_state()
   end
 
   f:close()
-  os.rename(tmp, path)
+  os.remove(path) -- Windows requires removing target before rename
+  local ok, err = os.rename(tmp, path)
+  if not ok then
+    DLOG("ERROR: rename %s -> %s failed: %s\n", tmp, path, tostring(err))
+    os.remove(tmp)
+    pending_write = true
+  end
+  release_lock(lockfile)
 end
 
 local function telemetry_host(askey, hostn, create)
@@ -307,27 +512,9 @@ local function load_telemetry()
 
   local path = ensure_telemetry_file_exists()
   if not path then return end
-  local f = io.open(path, "r")
-  if not f then return end
 
-  for line in f:lines() do
-    if line ~= "" and not line:match("^%s*#") then
-      local askey, hostn, strat, okv, failv, latv, tsv, cdv =
-        line:match("^([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]*)\t?([^\t]*)")
-      local s = tonumber(strat)
-      if askey and hostn and s and s >= 1 then
-        local r = telemetry_rec(askey, hostn, s, true)
-        if r then
-          r.ok = tonumber(okv) or 0
-          r.fail = tonumber(failv) or 0
-          r.lat = tonumber(latv) or 0
-          r.ts = tonumber(tsv) or 0
-          r.cooldown_until = tonumber(cdv) or 0
-        end
-      end
-    end
-  end
-  f:close()
+  merge_telemetry_file_into(TELEMETRY_FILE_PRIMARY, telemetry)
+  merge_telemetry_file_into(TELEMETRY_FILE_FALLBACK, telemetry)
 end
 
 local function write_telemetry()
@@ -339,13 +526,63 @@ local function write_telemetry()
 
   local path = choose_telemetry_file_for_write()
   if not path then return end
+
+  -- Acquire lock to prevent concurrent writes
+  local locked, lockfile = acquire_lock(path)
+  if not locked then return end
+
   local tmp = path .. ".tmp"
+
+  -- Read existing file to merge telemetry (prevents split-brain across processes)
+  local merged = {}
+  local f_in = io.open(path, "r")
+  if f_in then
+    for line in f_in:lines() do
+      if line ~= "" and not line:match("^%s*#") then
+        local askey, hostn, strat, okv, failv, latv, tsv, cdv =
+          line:match("^([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]*)\t?([^\t]*)")
+        local s = tonumber(strat)
+        if askey and hostn and s and s >= 1 then
+          if not merged[askey] then merged[askey] = {} end
+          if not merged[askey][hostn] then merged[askey][hostn] = {} end
+          merged[askey][hostn][s] = {
+            ok = tonumber(okv) or 0,
+            fail = tonumber(failv) or 0,
+            lat = tonumber(latv) or 0,
+            ts = tonumber(tsv) or 0,
+            cooldown_until = tonumber(cdv) or 0,
+          }
+        end
+      end
+    end
+    f_in:close()
+  end
+
+  -- Apply our in-memory telemetry over the merged data
+  for askey, hosts in pairs(telemetry) do
+    if not merged[askey] then merged[askey] = {} end
+    for hostn, strats in pairs(hosts) do
+      if not merged[askey][hostn] then merged[askey][hostn] = {} end
+      for s, rec in pairs(strats) do
+        if rec then
+          merged[askey][hostn][s] = rec
+        end
+      end
+    end
+  end
+
+  -- Evict entries with lowest total attempts if any key exceeds MAX_ENTRIES_PER_KEY
+  evict_telemetry_entries(merged)
+
   local f = io.open(tmp, "w")
-  if not f then return end
+  if not f then
+    release_lock(lockfile)
+    return
+  end
 
   f:write("# z2k autocircular telemetry\n")
   f:write("# key\thost\tstrategy\tok\tfail\tlat\tts\tcooldown_until\n")
-  for askey, hosts in pairs(telemetry) do
+  for askey, hosts in pairs(merged) do
     for hostn, strats in pairs(hosts) do
       for s, rec in pairs(strats) do
         if rec then
@@ -364,7 +601,13 @@ local function write_telemetry()
     end
   end
   f:close()
-  os.rename(tmp, path)
+  os.remove(path) -- Windows requires removing target before rename
+  local ok, err = os.rename(tmp, path)
+  if not ok then
+    DLOG("ERROR: rename %s -> %s failed: %s\n", tmp, path, tostring(err))
+    os.remove(tmp)
+  end
+  release_lock(lockfile)
 end
 
 local function telemetry_total_attempts(h)
@@ -578,6 +821,79 @@ local function persist_if_changed(askey, hostn, hrec)
   return true
 end
 
+local policy_explore_good = 0.03  -- exploration chance when current strategy is working (3%)
+local youtube_silent_retry_window_sec = 120
+local youtube_silent_retry_min_gap_sec = 2
+local youtube_silent_retry_threshold = 2
+local youtube_silent_retry = {}
+
+local function is_youtube_tcp_key(askey)
+  if not askey then return false end
+  local s = tostring(askey)
+  return s == "yt_tcp"
+end
+
+local function youtube_silent_retry_rec(askey, hostn, create)
+  if not askey or not hostn then return nil end
+  local a = youtube_silent_retry[askey]
+  if not a then
+    if not create then return nil end
+    a = {}
+    youtube_silent_retry[askey] = a
+  end
+  local r = a[hostn]
+  if not r and create then
+    r = { attempts = 0, strategy = 0, last_t = 0 }
+    a[hostn] = r
+  end
+  return r
+end
+
+local function reset_youtube_silent_retry(askey, hostn)
+  local r = youtube_silent_retry_rec(askey, hostn, false)
+  if not r then return end
+  r.attempts = 0
+  r.last_t = 0
+end
+
+local function maybe_rotate_youtube_silent_retry(desync, askey, hostn, hrec)
+  if not is_youtube_tcp_key(askey) then return nil, nil, nil end
+  if not desync or not desync.outgoing or desync.l7payload ~= "tls_client_hello" then
+    return nil, nil, nil
+  end
+  if not hrec then return nil, nil, nil end
+
+  local ct = tonumber(hrec.ctstrategy) or 0
+  local cur = tonumber(hrec.nstrategy) or 1
+  if cur < 1 then cur = 1 end
+
+  local now = now_f()
+  local r = youtube_silent_retry_rec(askey, hostn, true)
+  if not r then return nil, nil, nil end
+
+  local gap = now - (tonumber(r.last_t) or 0)
+  if tonumber(r.strategy) == cur and gap >= youtube_silent_retry_min_gap_sec and gap <= youtube_silent_retry_window_sec then
+    r.attempts = (tonumber(r.attempts) or 0) + 1
+  else
+    r.attempts = 1
+  end
+  r.strategy = cur
+  r.last_t = now
+
+  local attempts = tonumber(r.attempts) or 0
+  if attempts < youtube_silent_retry_threshold or ct < 2 then
+    return nil, nil, attempts
+  end
+
+  local next_strategy = cur >= ct and 1 or (cur + 1)
+  telemetry_record_event(askey, hostn, cur, false, nil, now)
+  hrec.nstrategy = next_strategy
+  r.strategy = next_strategy
+  r.attempts = 0
+  r.last_t = now
+  return cur, next_strategy, attempts
+end
+
 local function policy_seed_strategy(desync, askey, hostn, hrec)
   if not policy_enabled then return nil, nil end
   if not askey or not hostn or not hrec then return nil, nil end
@@ -598,7 +914,38 @@ local function policy_seed_strategy(desync, askey, hostn, hrec)
     return nil, nil
   end
 
-  local pick, score = policy_pick_strategy(askey, hostn, ct, now_f())
+  local now = now_f()
+
+  -- Respect current working strategy: if it has good telemetry and is not in
+  -- cooldown, keep it.  Only override with very low probability (3%) to allow
+  -- occasional exploration without destroying a known-good choice.
+  local current = tonumber(hrec.nstrategy)
+  if current and current >= 1 and current <= ct then
+    local cur_rec = telemetry_rec(askey, hostn, current, false)
+    if cur_rec then
+      local cur_ok = tonumber(cur_rec.ok) or 0
+      local cur_fail = tonumber(cur_rec.fail) or 0
+      local cur_total = cur_ok + cur_fail
+      if not telemetry_is_cooldown(cur_rec, now) and cur_total >= 2 then
+        local cur_rate = cur_ok / cur_total
+        if cur_rate > 0.5 then
+          if math.random() >= policy_explore_good then
+            if st then st.policy_seeded = true end
+            return nil, nil
+          end
+        end
+      end
+    else
+      -- No telemetry for current strategy yet: let it accumulate data.
+      -- This is critical for TCP profiles where success telemetry is never
+      -- recorded (incoming packets don't reach circular). Without this,
+      -- UCB would override persisted working strategies on every connection.
+      if st then st.policy_seeded = true end
+      return nil, nil
+    end
+  end
+
+  local pick, score = policy_pick_strategy(askey, hostn, ct, now)
   if pick and pick >= 1 and pick <= ct then
     hrec.nstrategy = pick
   end
@@ -668,46 +1015,69 @@ if type(cond_tcp_has_ts) ~= "function" then
   end
 end
 
--- Failure detector: treat any inbound fatal TLS alert record as a failure.
--- This helps autocircular rotate on early handshake aborts (e.g. Cloudflare ECH),
--- which are not counted by the standard retransmission-based detector.
-local function z2k_tcp_flag_set(dis, mask, letter)
-  local tcp = dis and dis.tcp
-  if not tcp then return false end
-  local flags = tcp.th_flags
-  if type(flags) == "number" then
-    return bitand(flags, mask) ~= 0
-  end
-  if type(flags) == "string" and letter and letter ~= "" then
-    return flags:find(letter, 1, true) ~= nil
-  end
-  return false
-end
+-- Extended failure detector beyond standard_failure_detector:
+-- 1. HTTP DPI redirect to block page (SLD mismatch for 301/303/308, not just 302/307)
+-- 2. HTTP block page keywords (lawfilter, rkn, etc.) as fallback
+-- 3. TLS fatal alert (Cloudflare ECH handshake_failure, etc.)
 
+-- Keyword-based block page detection (fallback when SLD check is unavailable).
+-- Catches DPI block pages by ISP-specific patterns in Location header or body.
 local function z2k_http_block_reply(payload)
   if type(payload) ~= "string" then return false end
   local code_s = payload:match("^HTTP/%d%.%d%s+([0-9][0-9][0-9])")
   local code = tonumber(code_s)
   if not code then return false end
 
+  -- Unambiguous block status codes
   if code == 403 or code == 451 then
     return true
   end
-  if code ~= 302 and code ~= 307 and code ~= 308 then
-    return false
-  end
 
-  local low = string.lower(payload)
-  if not low:find("\r\nlocation:", 1, true) then
-    return false
-  end
-  if low:find("block", 1, true) or
-     low:find("forbidden", 1, true) or
-     low:find("zapret", 1, true) or
-     low:find("rkn", 1, true) then
-    return true
+  -- Any redirect with block-indicating keywords in Location
+  if code == 301 or code == 302 or code == 303 or code == 307 or code == 308 then
+    local low = string.lower(payload)
+    if low:find("\r\nlocation:", 1, true) then
+      if low:find("block", 1, true) or
+         low:find("forbidden", 1, true) or
+         low:find("zapret", 1, true) or
+         low:find("rkn", 1, true) or
+         low:find("lawfilter", 1, true) or
+         low:find("restrict", 1, true) or
+         low:find("vigruzki", 1, true) or
+         low:find("eais", 1, true) or
+         low:find("warning", 1, true) or
+         low:find("blackhole", 1, true) then
+        return true
+      end
+    end
   end
   return false
+end
+
+-- SLD-based redirect detection: any redirect (301/302/303/307/308) to a
+-- different second-level domain is a DPI redirect. This is the most universal
+-- check — works for any ISP regardless of their block page URL patterns.
+-- standard_failure_detector only checks 302/307; we extend to all codes.
+local function z2k_http_dpi_redirect(desync)
+  if not desync or desync.outgoing then return false end
+  if desync.l7payload ~= "http_reply" then return false end
+  if not desync.track or not desync.track.hostname then return false end
+  if type(http_dissect_reply) ~= "function" then return false end
+  if type(array_field_search) ~= "function" then return false end
+  if type(is_dpi_redirect) ~= "function" then return false end
+
+  local hdis = http_dissect_reply(desync.dis.payload)
+  if not hdis then return false end
+  local c = hdis.code
+  -- 302/307 are already caught by standard_failure_detector, but re-checking
+  -- them here is harmless (crec.nocheck prevents double-counting) and makes
+  -- this function self-contained.
+  if c ~= 301 and c ~= 302 and c ~= 303 and c ~= 307 and c ~= 308 then
+    return false
+  end
+  local idx = array_field_search(hdis.headers, "header_low", "location")
+  if not idx then return false end
+  return is_dpi_redirect(desync.track.hostname, hdis.headers[idx].value)
 end
 
 function z2k_tls_alert_fatal(desync, crec)
@@ -719,26 +1089,47 @@ function z2k_tls_alert_fatal(desync, crec)
   if not desync or desync.outgoing then return false end
   local dis = desync.dis
 
-  -- Transport-layer hard failures.
-  if z2k_tcp_flag_set(dis, 0x04, "R") then
+  -- RST and FIN are handled by standard_failure_detector (RST within inseq=4K,
+  -- retransmissions within maxseq=32K). We do NOT extend these checks because:
+  -- - DPI sends RST early (within first few hundred bytes), already covered
+  -- - FIN is normal TCP close, NOT a DPI signal. Short connections (TLS 1.3
+  --   session resumption + small API response < 4K) would cause false positives:
+  --   success_detector (inseq=4K) hasn't fired yet when FIN arrives, so the
+  --   failure detector runs and counts normal connection close as failure.
+  --   With fails=2, two short API calls within 60s = false rotation.
+
+  -- HTTP DPI redirect: ISP redirects to block page (e.g. lawfilter.ertelecom.ru).
+  -- SLD-based check is universal for any ISP; keyword-based is a fallback.
+  if z2k_http_dpi_redirect(desync) then
     return true
   end
-  if z2k_tcp_flag_set(dis, 0x01, "F") then
-    local pfin = dis and dis.payload
-    if type(pfin) ~= "string" or #pfin == 0 then
-      return true
-    end
-  end
-
   local payload = dis and dis.payload
   if z2k_http_block_reply(payload) then
     return true
   end
+
+  -- TLS fatal alert (e.g. Cloudflare ECH handshake_failure)
   if type(payload) ~= "string" then return false end
   if #payload < 7 then return false end
   if payload:byte(1) ~= 0x15 then return false end -- TLS record: alert (21)
   if payload:byte(6) ~= 0x02 then return false end -- alert level: fatal (2)
   return true
+end
+
+-- Conservative success detector for TCP profiles.
+-- Detects success but does NOT reset host failure counters.
+-- This is important for TV clients: successful handshakes from other devices
+-- on the same domain must not mask repeated webOS failures.
+function z2k_success_no_reset(desync, crec)
+  if type(standard_success_detector) ~= "function" then return false end
+  local ok, result = pcall(standard_success_detector, desync, crec)
+  if ok and result then
+    if crec then
+      crec.nocheck = true
+    end
+    return false
+  end
+  return false
 end
 
 -- Wrap circular() from zapret-auto.lua.
@@ -747,9 +1138,12 @@ if type(circular) == "function" then
   circular = function(ctx, desync)
     local askey_before, hostn_before, hrec_before
     local policy_pick_before, policy_score_before
+    local silent_rotate_from_before, silent_rotate_to_before, silent_attempts_before
     pcall(function()
       askey_before, hostn_before, hrec_before = get_record_for_desync(desync, true)
       if hrec_before then
+        silent_rotate_from_before, silent_rotate_to_before, silent_attempts_before =
+          maybe_rotate_youtube_silent_retry(desync, askey_before, hostn_before, hrec_before)
         policy_pick_before, policy_score_before = policy_seed_strategy(desync, askey_before, hostn_before, hrec_before)
         flow_start_if_needed(desync, hrec_before.nstrategy)
       end
@@ -797,11 +1191,24 @@ if type(circular) == "function" then
         (desync and desync.l7payload == "quic_initial") and
         (not failure_after) and
         n_after and n_after > 1
+      -- Persist on every outgoing initial packet as a fallback. Some profiles
+      -- still expose success only indirectly, and even the restored manual
+      -- YouTube layout benefits from saving the active candidate immediately.
+      -- write_state() is rate-limited (2s) and persist_if_changed() skips
+      -- redundant writes.
+      local outgoing_initial = desync and desync.outgoing and n_after and
+        (desync.l7payload == "tls_client_hello" or
+         desync.l7payload == "quic_initial" or
+         desync.l7payload == "http_req")
       local success_event = successful_state or response_state or quic_candidate_state
       local failure_event = failure_after and (not success_event)
       local persisted = false
-      if success_event then
+      if success_event or outgoing_initial then
         persisted = persist_if_changed(askey, hostn, hrec)
+      end
+
+      if success_event or failure_event then
+        reset_youtube_silent_retry(askey, hostn)
       end
 
       local latency_s, flow_strategy = nil, nil
@@ -817,7 +1224,7 @@ if type(circular) == "function" then
         write_state()
       end
 
-      local debug_event = persisted or failure_after or success_event or failure_event or (policy_pick_before ~= nil)
+      local debug_event = persisted or failure_after or success_event or failure_event or outgoing_initial or (policy_pick_before ~= nil)
       if debug_event and (should_debug_key(askey_before) or should_debug_key(askey_after)) then
         local track = desync and desync.track
         local hn = track and track.hostname or ""
@@ -837,6 +1244,10 @@ if type(circular) == "function" then
           " success_state=" .. tostring(successful_state and 1 or 0) ..
           " response_state=" .. tostring(response_state and 1 or 0) ..
           " quic_candidate_state=" .. tostring(quic_candidate_state and 1 or 0) ..
+          " outgoing_initial=" .. tostring(outgoing_initial and 1 or 0) ..
+          " silent_attempts=" .. tostring(silent_attempts_before or 0) ..
+          " silent_rotate_from=" .. tostring(silent_rotate_from_before or "") ..
+          " silent_rotate_to=" .. tostring(silent_rotate_to_before or "") ..
           " success_event=" .. tostring(success_event and 1 or 0) ..
           " failure_event=" .. tostring(failure_event and 1 or 0) ..
           " latency_s=" .. tostring(latency_s or "") ..
