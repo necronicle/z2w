@@ -238,6 +238,7 @@ class App:
         self._err_var.set("")
         try:
             os.makedirs(os.path.join(SCRIPT_DIR, "cache", "autocircular"), exist_ok=True)
+            self._kill_stale_winws()
             self._unblock_files()
             args = self._build_args()
             self.process = subprocess.Popen(
@@ -259,10 +260,35 @@ class App:
         self._refresh_visuals()
         threading.Thread(target=self._watch_process, daemon=True).start()
 
+    @staticmethod
+    def _kill_tree(pid: int):
+        """Убить процесс и всё дерево потомков через taskkill /T."""
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _kill_stale_winws():
+        """Убить все оставшиеся winws2.exe (на случай orphan-процессов)."""
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/IM", "winws2.exe"],
+                capture_output=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        except Exception:
+            pass
+
     def _stop(self):
         if self.process:
+            pid = self.process.pid
+            self._kill_tree(pid)
             try:
-                self.process.terminate()
                 self.process.wait(timeout=5)
             except Exception:
                 try:
@@ -270,6 +296,7 @@ class App:
                 except Exception:
                     pass
             self.process = None
+        self._kill_stale_winws()
         self.running = False
         self._refresh_visuals()
 
