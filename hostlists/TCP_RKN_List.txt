@@ -647,6 +647,7 @@ adessetextile.ru
 adexa48.ru
 adfixzz.click
 adguardvpn-help.com
+adguard.com
 adict.click
 adidaseqtcushion91.info
 adigeyaislam.com
@@ -125430,3 +125431,9 @@ zzzooo.space
 zzztube.com
 zzztube.tv
 zzzz2.live
+
+# === Samsung SmartThings ===
+smartthings.com
+samsungiotcloud.com
+samsungaccount.com
+samsungcloud.com

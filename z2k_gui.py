@@ -24,6 +24,7 @@ else:
 
 WINWS_EXE   = os.path.join(SCRIPT_DIR, "winws2.exe")
 PROFILES    = os.path.join(SCRIPT_DIR, "profiles.default.txt")
+RKN_SILENT_FLAG = os.path.join(SCRIPT_DIR, "cache", "autocircular", "rkn_silent_fallback.flag")
 
 _UNBLOCK_NAMES = ["winws2.exe", "cygwin1.dll", "WinDivert.dll", "WinDivert64.sys"]
 
@@ -100,7 +101,7 @@ def lerp_color(c1: str, c2: str, t: float) -> str:
 
 # ─── Приложение ──────────────────────────────────────────────────────────────
 
-WIN_W, WIN_H = 300, 360
+WIN_W, WIN_H = 300, 390
 CV_S = 230        # квадратный холст
 CX = CY = CV_S // 2
 
@@ -199,6 +200,18 @@ class App:
         )
         self._status_lbl.pack()
 
+        # RKN Silent Fallback
+        self._rkn_silent_var = tk.BooleanVar(value=os.path.isfile(RKN_SILENT_FLAG))
+        self._rkn_silent_cb = tk.Checkbutton(
+            r, text="RKN silent fallback",
+            variable=self._rkn_silent_var,
+            command=self._toggle_rkn_silent,
+            bg=BG, fg="#44447a", activebackground=BG, activeforeground="#5555aa",
+            selectcolor="#14142a", font=("Segoe UI", 8),
+            highlightthickness=0, bd=0,
+        )
+        self._rkn_silent_cb.pack(pady=(4, 0))
+
         # Ошибки
         self._err_var = tk.StringVar()
         tk.Label(r, textvariable=self._err_var,
@@ -212,6 +225,18 @@ class App:
             self._stop()
         else:
             self._start()
+
+    def _toggle_rkn_silent(self):
+        """Создать или удалить flag-файл RKN silent fallback."""
+        os.makedirs(os.path.dirname(RKN_SILENT_FLAG), exist_ok=True)
+        if self._rkn_silent_var.get():
+            with open(RKN_SILENT_FLAG, "w") as f:
+                f.write("1")
+        else:
+            try:
+                os.remove(RKN_SILENT_FLAG)
+            except FileNotFoundError:
+                pass
 
     def _unblock_files(self):
         for name in _UNBLOCK_NAMES:
