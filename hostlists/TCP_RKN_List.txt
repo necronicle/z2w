@@ -76686,6 +76686,7 @@ numendoxapp-soft.com
 numera-hotel.ru
 numes-portem.ru
 numi24.ru
+numista.com
 numizmat.com.ua
 numocannabis.com
 numovs.com
@@ -125437,3 +125438,14 @@ smartthings.com
 samsungiotcloud.com
 samsungaccount.com
 samsungcloud.com
+
+# Google Meet
+meetings.googleapis.com
+stream.meet.google.com
+workspace.turns.goog
+meet.turns.goog
+stun.l.google.com
+stun1.l.google.com
+stun2.l.google.com
+stun3.l.google.com
+stun4.l.google.com

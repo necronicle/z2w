@@ -43,18 +43,26 @@ _INSTAGRAM_DNS = {
 }
 
 BASE_ARGS = [
-    "--wf-tcp-out=443,2053,2083,2087,2096,8443",
+    "--wf-tcp-out=80,443,2053,2083,2087,2096,8443",
     "--lua-init=@lua/zapret-lib.lua",
     "--lua-init=@lua/zapret-antidpi.lua",
     "--lua-init=@lua/zapret-auto.lua",
     "--lua-init=@lua/locked.lua",
+    "--lua-init=@lua/z2k-detectors.lua",
+    "--lua-init=@lua/z2k-fooling-ext.lua",
+    "--lua-init=@lua/z2k-range-rand.lua",
     "--lua-init=@lua/z2k-autocircular.lua",
     "--lua-init=@lua/z2k-modern-core.lua",
+    "--lua-init=@lua/z2k-dynamic-strategy.lua",
     "--blob=quic_google:files/quic_initial_www_google_com.bin",
+    "--blob=quic_rutracker:files/quic_initial_rutracker_org.bin",
+    "--blob=quic_ozon_ru:files/quic_initial_ozon_ru.bin",
+    "--blob=quic_dbankcloud:files/quic_initial_dbankcloud_ru.bin",
     "--blob=quic1:files/quic_1.bin",
     "--blob=quic4:files/quic_4.bin",
     "--blob=quic5:files/quic_5.bin",
     "--blob=quic6:files/quic_6.bin",
+    "--blob=quic_test:files/quic_test_00.bin",
     "--blob=stun:files/stun.bin",
     "--blob=syn_packet:files/syn_packet.bin",
     "--blob=tls_max_ru:files/tls_clienthello_max_ru.bin",
@@ -66,13 +74,15 @@ BASE_ARGS = [
     "--blob=tls_clienthello_gosuslugi_ru:files/tls_clienthello_gosuslugi_ru.bin",
     "--blob=tls_clienthello_www_onetrust_com:files/tls_clienthello_www_onetrust_com.bin",
     "--blob=t2:files/t2.bin",
+    "--blob=zero_256:files/zero_256.bin",
+    "--blob=http_iana:files/http_iana_org.bin",
     "--wf-raw-part=@windivert.filter/windivert_part.discord_media.txt",
     "--wf-raw-part=@windivert.filter/windivert_part.stun.txt",
     "--wf-raw-part=@windivert.filter/windivert_part.wireguard.txt",
     "--wf-raw-part=@windivert.filter/windivert_part.quic_initial_ietf.txt",
 ]
 
-VERSION = "1.2.0"
+VERSION = "1.4.0"
 
 # ─── UAC ─────────────────────────────────────────────────────────────────────
 

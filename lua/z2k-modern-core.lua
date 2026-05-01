@@ -1,13 +1,43 @@
 -- z2k-modern-core.lua
 -- Core-level desync extensions for z2k:
 -- 1) custom 3-fragment IP fragmenters (with optional overlap)
--- 2) TLS ClientHello extension-order morphing (fingerprint drift)
+-- 2) QUIC Initial packet morphing (timing/fingerprint)
+-- 3) UDP fake-injection handler for games (z2k_game_udp)
+--
+-- Trimmed 2026-04-18: removed z2k_tls_extshuffle, z2k_tls_fp_pack_v2,
+-- z2k_tcpoverlap3, z2k_ech_passthrough, z2k_strategy_profile. None of
+-- these were referenced from any strategy, init script or test — they
+-- were ~400 lines of dead bytecode living in every nfqws2 Lua VM. Also
+-- dropped their private helpers (z2k_tls_ext_is_fixed, z2k_shuffle,
+-- z2k_shuffle_range, z2k_overlap_state, z2k_parse_order3,
+-- z2k_resolve_marker_pos). Can be restored from git if a future
+-- strategy actually wants them.
 
-math.randomseed(os.time() or 0)
+-- Seed PRNG with better entropy when available
+do
+    local seed = os.time() or 0
+    local f = io.open("/dev/urandom", "rb")
+    if f then
+        local bytes = f:read(4)
+        f:close()
+        if bytes and #bytes == 4 then
+            seed = seed + bytes:byte(1) + bytes:byte(2) * 256 +
+                   bytes:byte(3) * 65536 + bytes:byte(4) * 16777216
+        end
+    end
+    math.randomseed(seed)
+end
+
+-- Fallback stubs for nfqws2 runtime globals (prevents crash if loaded standalone)
+if type(DLOG) ~= "function" then DLOG = function() end end
+if type(DLOG_ERR) ~= "function" then DLOG_ERR = function() end end
 
 local function z2k_num(v, fallback)
     local n = tonumber(v)
     if n == nil then return fallback end
+    -- Clamp to safe range for bit operations and array indexing
+    if n > 2147483647 then n = 2147483647 end
+    if n < -2147483648 then n = -2147483648 end
     return n
 end
 
@@ -196,34 +226,6 @@ function z2k_ipfrag3_tiny(dis, ipfrag_options)
     return z2k_ipfrag3(dis, opts)
 end
 
-local function z2k_tls_ext_is_fixed(ext)
-    if not ext or ext.type == nil then return true end
-    if TLS_EXT_SERVER_NAME and ext.type == TLS_EXT_SERVER_NAME then return true end
-    if TLS_EXT_PRE_SHARED_KEY and ext.type == TLS_EXT_PRE_SHARED_KEY then return true end
-    return false
-end
-
-local function z2k_shuffle(tbl)
-    for i = #tbl, 2, -1 do
-        local j = math.random(i)
-        tbl[i], tbl[j] = tbl[j], tbl[i]
-    end
-end
-
-local function z2k_shuffle_range(tbl, i1, i2)
-    local a = tonumber(i1) or 1
-    local b = tonumber(i2) or #tbl
-    if a < 1 then a = 1 end
-    if b > #tbl then b = #tbl end
-    if a >= b then
-        return
-    end
-    for i = b, a + 1, -1 do
-        local j = math.random(a, i)
-        tbl[i], tbl[j] = tbl[j], tbl[i]
-    end
-end
-
 local function z2k_clamp(v, lo, hi, fallback)
     local n = tonumber(v)
     if n == nil then n = fallback end
@@ -262,7 +264,10 @@ local function z2k_quic_reserved_version_bytes()
 end
 
 local function z2k_qvarint_decode_bytes(bytes, pos, nbytes)
-    local b0 = bytes and bytes[pos]
+    if type(bytes) ~= "table" then
+        return nil, nil
+    end
+    local b0 = bytes[pos]
     if not b0 then
         return nil, nil
     end
@@ -468,23 +473,6 @@ local function z2k_timing_state(desync)
     return st, rec
 end
 
-local function z2k_overlap_state(desync)
-    if not desync or not desync.track then
-        return nil
-    end
-    local st = desync.track.lua_state
-    if type(st) ~= "table" then
-        return nil
-    end
-    local key = "__z2k_ov3_" .. tostring(desync.func_instance or "z2k_tcpoverlap3")
-    local rec = st[key]
-    if type(rec) ~= "table" then
-        rec = { out_seen = 0 }
-        st[key] = rec
-    end
-    return rec
-end
-
 local function z2k_quic_state(desync)
     if not desync or not desync.track then
         return nil
@@ -500,193 +488,6 @@ local function z2k_quic_state(desync)
         st[key] = rec
     end
     return rec
-end
-
-local function z2k_parse_order3(s)
-    local order = { 3, 2, 1 }
-    if s == nil or s == "" then
-        return order
-    end
-    local out = {}
-    local seen = {}
-    for part in tostring(s):gmatch("[^,]+") do
-        local n = tonumber(part)
-        if n and n >= 1 and n <= 3 and not seen[n] then
-            table.insert(out, n)
-            seen[n] = true
-        end
-    end
-    if #out ~= 3 then
-        return order
-    end
-    return out
-end
-
-local function z2k_resolve_marker_pos(payload, l7payload, marker, fallback)
-    if marker == nil or marker == "" then
-        return fallback
-    end
-    local n = tonumber(marker)
-    if n ~= nil then
-        return n
-    end
-    local ok, v = pcall(resolve_pos, payload, l7payload, marker, false)
-    if ok and v then
-        return tonumber(v) or fallback
-    end
-    return fallback
-end
-
--- Reorder non-critical TLS ClientHello extensions in-place.
--- Intended to blur stable JA3/JA4-style extension-order fingerprints.
-function z2k_tls_extshuffle(ctx, desync)
-    if not desync or not desync.dis or not desync.dis.tcp then
-        if desync and desync.dis and not desync.dis.icmp then
-            instance_cutoff_shim(ctx, desync)
-        end
-        return
-    end
-
-    direction_cutoff_opposite(ctx, desync, "out")
-    if not direction_check(desync, "out") then return end
-    if not payload_check(desync, "tls_client_hello") then return end
-
-    local tdis = tls_dissect(desync.dis.payload)
-    if not tdis or not tdis.handshake or not tdis.handshake[TLS_HANDSHAKE_TYPE_CLIENT] then
-        return
-    end
-
-    local ch = tdis.handshake[TLS_HANDSHAKE_TYPE_CLIENT].dis
-    if not ch or type(ch.ext) ~= "table" or #ch.ext < 4 then
-        return
-    end
-
-    local movable_idx = {}
-    local movable_ext = {}
-    for i = 1, #ch.ext do
-        if not z2k_tls_ext_is_fixed(ch.ext[i]) then
-            table.insert(movable_idx, i)
-            table.insert(movable_ext, ch.ext[i])
-        end
-    end
-
-    if #movable_ext < 2 then
-        return
-    end
-
-    z2k_shuffle(movable_ext)
-    for i = 1, #movable_idx do
-        ch.ext[movable_idx[i]] = movable_ext[i]
-    end
-
-    local tls_new = tls_reconstruct(tdis)
-    if not tls_new then
-        DLOG_ERR("z2k_tls_extshuffle: reconstruct error")
-        return
-    end
-
-    desync.dis.payload = tls_new
-    return VERDICT_MODIFY
-end
-
--- TLS fingerprint morph pack v2.
--- Combines extension-order shuffle with bounded cipher/group/alpn permutation.
--- Goal: increase JA3/JA4 drift while preserving compatibility guardrails.
---
--- args:
---   dir=out
---   payload=tls_client_hello
---   cs_keep_head=3                     ; keep first N cipher suites fixed
---   groups_keep_head=1                 ; keep first N supported groups fixed
---   alpn_chance=50                     ; chance (%) to shuffle ALPN order
---   pad_min=0 pad_max=0                ; add TLS Padding extension (type 21) with random length
-function z2k_tls_fp_pack_v2(ctx, desync)
-    if not desync or not desync.dis or not desync.dis.tcp then
-        return
-    end
-    direction_cutoff_opposite(ctx, desync, "out")
-    if not direction_check(desync, "out") then return end
-    if not payload_check(desync, "tls_client_hello") then return end
-
-    local arg = desync.arg or {}
-    local tdis = tls_dissect(desync.dis.payload)
-    if not tdis or not tdis.handshake or not tdis.handshake[TLS_HANDSHAKE_TYPE_CLIENT] then
-        return
-    end
-    local ch = tdis.handshake[TLS_HANDSHAKE_TYPE_CLIENT].dis
-    if not ch then
-        return
-    end
-
-    local changed = false
-
-    local pad_min = z2k_clamp(arg.pad_min, 0, 2000, 0)
-    local pad_max = z2k_clamp(arg.pad_max, 0, 2000, 0)
-    local pad_len = z2k_rand_between(pad_min, pad_max)
-    if type(ch.ext) == "table" and pad_len > 0 then
-        -- Add TLS Padding extension (type 21)
-        table.insert(ch.ext, {
-            type = 21,
-            len = pad_len,
-            data = string.rep("\0", pad_len)
-        })
-        changed = true
-    end
-
-    if type(ch.ext) == "table" and #ch.ext >= 4 then
-        local movable_idx = {}
-        local movable_ext = {}
-        for i = 1, #ch.ext do
-            if not z2k_tls_ext_is_fixed(ch.ext[i]) then
-                table.insert(movable_idx, i)
-                table.insert(movable_ext, ch.ext[i])
-            end
-        end
-        if #movable_ext >= 2 then
-            z2k_shuffle(movable_ext)
-            for i = 1, #movable_idx do
-                ch.ext[movable_idx[i]] = movable_ext[i]
-            end
-            changed = true
-        end
-    end
-
-    if type(ch.cipher_suites) == "table" and #ch.cipher_suites >= 6 then
-        local keep = z2k_clamp(arg.cs_keep_head, 0, #ch.cipher_suites - 2, 3)
-        z2k_shuffle_range(ch.cipher_suites, keep + 1, #ch.cipher_suites)
-        changed = true
-    end
-
-    if type(ch.ext) == "table" then
-        local t_alpn = TLS_EXT_ALPN or 16
-        local t_groups = TLS_EXT_SUPPORTED_GROUPS or 10
-        local alpn_chance = z2k_clamp(arg.alpn_chance, 0, 100, 50)
-
-        for i = 1, #ch.ext do
-            local e = ch.ext[i]
-            if e and e.type == t_groups and e.dis and type(e.dis.list) == "table" and #e.dis.list >= 3 then
-                local keep_g = z2k_clamp(arg.groups_keep_head, 0, #e.dis.list - 2, 1)
-                z2k_shuffle_range(e.dis.list, keep_g + 1, #e.dis.list)
-                changed = true
-            elseif e and e.type == t_alpn and e.dis and type(e.dis.list) == "table" and #e.dis.list >= 2 then
-                if math.random(100) <= alpn_chance then
-                    z2k_shuffle(e.dis.list)
-                    changed = true
-                end
-            end
-        end
-    end
-
-    if not changed then
-        return
-    end
-    local tls_new = tls_reconstruct(tdis)
-    if not tls_new then
-        DLOG_ERR("z2k_tls_fp_pack_v2: reconstruct error")
-        return
-    end
-    desync.dis.payload = tls_new
-    return VERDICT_MODIFY
 end
 
 -- Timing/size/burst morphing for first handshake packets.
@@ -772,114 +573,6 @@ function z2k_timing_morph(ctx, desync)
             DLOG("z2k_timing_morph: guarded drop seq=" .. tostring(seq))
             return VERDICT_DROP
         end
-    end
-end
-
--- Advanced TCP overlap/reorder primitive.
--- Sends 3 overlapping pieces with custom send order, then drops original packet.
---
--- args:
---   dir=out
---   payload=tls_client_hello,http_req
---   packets=2
---   pos1=midsld|<num>                   ; first split point (1-based)
---   pos2=sld+1|<num>                    ; second split point (1-based)
---   span=24                             ; used when pos2 is missing
---   ov12=8 ov23=8                       ; overlap size in bytes
---   order=3,2,1                         ; send order for parts
---   nodrop                              ; keep original packet (debug/fallback)
-function z2k_tcpoverlap3(ctx, desync)
-    if not desync or not desync.dis or not desync.dis.tcp then
-        return
-    end
-
-    direction_cutoff_opposite(ctx, desync, "out")
-    if not direction_check(desync, "out") then
-        return
-    end
-    if not payload_check(desync, "tls_client_hello,http_req") then
-        return
-    end
-
-    if replay_drop(desync) then
-        return VERDICT_DROP
-    end
-    if not replay_first(desync) then
-        return
-    end
-
-    local arg = desync.arg or {}
-    local rec = z2k_overlap_state(desync)
-    if not rec then
-        return
-    end
-    local max_packets = z2k_clamp(arg.packets, 1, 16, 2)
-    rec.out_seen = (tonumber(rec.out_seen) or 0) + 1
-    if rec.out_seen > max_packets then
-        instance_cutoff_shim(ctx, desync, true)
-        return
-    end
-
-    local payload = desync.reasm_data or desync.dis.payload or ""
-    local plen = #payload
-    if plen < 12 then
-        return
-    end
-
-    local p1_def = math.floor(plen / 3)
-    if p1_def < 2 then p1_def = 2 end
-    local p2_def = p1_def + z2k_clamp(arg.span, 8, 4096, 24)
-
-    local p1 = z2k_resolve_marker_pos(payload, desync.l7payload, arg.pos1, p1_def)
-    local p2 = z2k_resolve_marker_pos(payload, desync.l7payload, arg.pos2, p2_def)
-    p1 = z2k_clamp(p1, 2, plen - 2, p1_def)
-    p2 = z2k_clamp(p2, p1 + 1, plen - 1, p2_def)
-
-    local ov12 = z2k_clamp(arg.ov12, 0, p1, 8)
-    local ov23 = z2k_clamp(arg.ov23, 0, p2, 8)
-
-    local off2 = p1 - ov12
-    local off3 = p2 - ov23
-    if off2 < 0 then off2 = 0 end
-    if off3 <= off2 then off3 = off2 + 1 end
-    if off3 >= plen then off3 = plen - 1 end
-    if off3 <= off2 then
-        return
-    end
-
-    local seg1 = payload:sub(1, p1)
-    local seg2 = payload:sub(off2 + 1, p2)
-    local seg3 = payload:sub(off3 + 1, plen)
-    if seg1 == "" or seg2 == "" or seg3 == "" then
-        return
-    end
-
-    local segs = { seg1, seg2, seg3 }
-    local seqs = { 0, off2, off3 }
-    local order = z2k_parse_order3(arg.order)
-    local rs = z2k_rawsend_ctx(desync, 1)
-    local ok_send = true
-
-    for i = 1, #order do
-        local idx = order[i]
-        local ok = pcall(rawsend_payload_segmented, desync, segs[idx], seqs[idx], {
-            rawsend = rs
-        })
-        if not ok then
-            ok_send = false
-            break
-        end
-    end
-
-    if not ok_send then
-        replay_drop_set(desync, false)
-        return
-    end
-
-    local nodrop = arg.nodrop ~= nil
-    replay_drop_set(desync, not nodrop)
-    if not nodrop then
-        return VERDICT_DROP
     end
 end
 
@@ -995,4 +688,105 @@ function z2k_quic_morph_v2(ctx, desync)
     if arg.nodrop == nil then
         return VERDICT_DROP
     end
+end
+
+-- ---------------------------------------------------------------------------
+-- z2k_game_udp: UDP fake-injection desync for game/unknown protocols.
+-- ---------------------------------------------------------------------------
+-- Problem this solves
+--   nfqws2's built-in `fake` action (zapret-antidpi.lua:fake) calls
+--   rawsend_payload_segmented(desync, fake_payload) WITHOUT options and without
+--   apply_fooling(), so BOTH `ip_ttl` AND `repeats` are silently dropped for
+--   UDP fakes. That made it impossible to replicate the classic nfqws1 recipe
+--
+--       --dpi-desync=fake
+--       --dpi-desync-any-protocol=1
+--       --dpi-desync-fake-unknown-udp=<blob>
+--       --dpi-desync-ttl=4
+--       --dpi-desync-repeats=10
+--
+--   which works reliably for Roblox and other low-latency UDP game protocols
+--   behind Russian DPI on Keenetic.
+--
+-- What this handler does
+--   For each outgoing UDP datagram that matches the payload filter:
+--     1. deepcopy the current dissect
+--     2. replace the L7 payload with the configured blob
+--     3. apply_fooling(..)     — honours ip_ttl / ip6_ttl / ip_autottl / tcp_*
+--     4. apply_ip_id(..)       — keeps ip_id sane
+--     5. rawsend_dissect_ipfrag with desync_opts(desync) so `repeats=N` from
+--        the command line actually takes effect
+--   The original packet is kept (no drop), matching nfqws1's fake behaviour
+--   where the real packet is allowed through after the fakes.
+--
+-- Args (all optional unless noted)
+--   blob=<name>         REQUIRED. fake payload blob (e.g. quic_initial_www_google_com)
+--   ip_ttl=<int>        IPv4 TTL for the fake packet (e.g. 4)
+--   ip6_ttl=<int>       IPv6 hop limit for the fake packet
+--   ip_autottl=<spec>   auto-derived TTL (see zapret-lib parse_autottl)
+--   repeats=<int>       how many copies of the fake to emit per real packet
+--   dir=out|in|any      direction filter (default: out)
+--   payload=<list>      comma-separated l7 filter (default: all)
+--   optional            skip silently if blob is missing
+--   badsum              send with deliberately bad L4 checksum (DPI fooling)
+--
+-- Usage example (place in /opt/zapret2/init.d/<platform>/custom.d/)
+--   NFQWS_OPT_DESYNC_GAME="--filter-udp=1024-65535 ${GAME_IPSET_OPT}\
+--     --in-range=a --out-range=-n2 --payload=all \
+--     --lua-desync=z2k_game_udp:dir=out:blob=quic_initial_www_google_com:ip_ttl=4:repeats=10"
+--
+-- Mirrors nfqws1 cutoff=n2 via --out-range=-n2 at the wrapper level, and
+-- repeats=10 / ip_ttl=4 / blob=... via the handler args.
+
+function z2k_game_udp(ctx, desync)
+    -- Always fire on outgoing side by default; cut off opposite direction so
+    -- the instance doesn't waste cycles on inbound replies.
+    direction_cutoff_opposite(ctx, desync)
+
+    -- Only UDP. For related icmp packets (e.g. ICMP unreachable) pass through
+    -- without cutting off the instance, mirroring fake()/rst() in zapret-antidpi.
+    if not desync.dis.udp then
+        if not desync.dis.icmp then instance_cutoff_shim(ctx, desync) end
+        return
+    end
+
+    if not (direction_check(desync) and payload_check(desync, "all")) then
+        return
+    end
+
+    -- Only emit fakes on the first replay pass (mirrors built-in fake).
+    if not replay_first(desync) then
+        DLOG("z2k_game_udp: not acting on further replay pieces")
+        return
+    end
+
+    if not desync.arg.blob then
+        error("z2k_game_udp: 'blob' arg required")
+    end
+
+    if desync.arg.optional and not blob_exist(desync, desync.arg.blob) then
+        DLOG("z2k_game_udp: blob '"..desync.arg.blob.."' not found. skipped")
+        return
+    end
+
+    local fake_payload = blob(desync, desync.arg.blob)
+    if b_debug then
+        DLOG("z2k_game_udp: blob="..desync.arg.blob.." ttl="..tostring(desync.arg.ip_ttl).." repeats="..tostring(desync.arg.repeats))
+    end
+
+    -- Build the fake packet from the current dissect. deepcopy so we don't
+    -- perturb the real packet the kernel will deliver afterwards.
+    local dis = deepcopy(desync.dis)
+    dis.payload = fake_payload
+
+    -- Apply ip_ttl / ip_autottl / ip6_ttl / badsum etc. Crucially, this is
+    -- where ip_ttl actually gets written to dis.ip.ip_ttl — the built-in
+    -- fake() skips this step, which is the whole reason we exist.
+    apply_fooling(desync, dis)
+    apply_ip_id(desync, dis, nil, "none")
+
+    -- rawsend_dissect_ipfrag honours options.rawsend.repeats, so supplying
+    -- the full desync_opts bundle makes `repeats=N` on the command line
+    -- emit N copies per real packet.
+    rawsend_dissect_ipfrag(dis, desync_opts(desync))
 end

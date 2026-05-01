@@ -11,21 +11,33 @@
 -- - We do NOT change rotation logic; only persist/restore.
 -- - Storage key uses `desync.arg.key` when provided; otherwise falls back to `desync.func_instance`.
 
+local function z2w_tmp_path(name)
+  local base = os.getenv("TEMP") or os.getenv("TMP") or "."
+  return base .. "/" .. name
+end
+
 local STATE_DIR_PRIMARY = "cache/autocircular"
 local STATE_FILE_PRIMARY = STATE_DIR_PRIMARY .. "/state.tsv"
-local STATE_FILE_FALLBACK = (os.getenv("TEMP") or ".") .. "/z2k-autocircular-state.tsv"
+local STATE_FILE_FALLBACK = z2w_tmp_path("z2k-autocircular-state.tsv")
 local TELEMETRY_FILE_PRIMARY = STATE_DIR_PRIMARY .. "/telemetry.tsv"
-local TELEMETRY_FILE_FALLBACK = (os.getenv("TEMP") or ".") .. "/z2k-autocircular-telemetry.tsv"
+local TELEMETRY_FILE_FALLBACK = z2w_tmp_path("z2k-autocircular-telemetry.tsv")
 local DEBUG_FLAG_PRIMARY = STATE_DIR_PRIMARY .. "/debug.flag"
-local DEBUG_FLAG_FALLBACK = (os.getenv("TEMP") or ".") .. "/z2k-autocircular-debug.flag"
+local DEBUG_FLAG_FALLBACK = z2w_tmp_path("z2k-autocircular-debug.flag")
 local DEBUG_LOG_PRIMARY = STATE_DIR_PRIMARY .. "/debug.log"
-local DEBUG_LOG_FALLBACK = (os.getenv("TEMP") or ".") .. "/z2k-autocircular-debug.log"
+local DEBUG_LOG_FALLBACK = z2w_tmp_path("z2k-autocircular-debug.log")
 local RKN_SILENT_FLAG = STATE_DIR_PRIMARY .. "/rkn_silent_fallback.flag"
+local PROBE_OVERRIDE_FILE = z2w_tmp_path("z2k-probe-override.tsv")
+local PROBE_OVERRIDE_TTL = 0.05
+local PROBE_OVERRIDE_MAX_AGE = 300
 
 local loaded = false
 local state = {} -- state[askey][host_norm] = { strategy = N, ts = unix_time }
 local telemetry_loaded = false
 local telemetry = {} -- telemetry[askey][hostn][strategy] = { ok, fail, lat, ts, cooldown_until }
+local probe_override_loaded_at = -1
+local probe_overrides = {}
+local probe_override_saved = {}
+local probe_commit_seen = {}
 
 local last_write = 0
 local write_interval = 2 -- seconds
@@ -40,9 +52,34 @@ local debug_refresh_interval = 5 -- seconds
 local rkn_silent_enabled = false
 local rkn_silent_checked_at = 0
 
-math.randomseed(os.time() or 0)
+-- Seed PRNG with better entropy when available
+do
+    local seed = os.time() or 0
+    local f = io.open("/dev/urandom", "rb")
+    if f then
+        local bytes = f:read(4)
+        f:close()
+        if bytes and #bytes == 4 then
+            seed = seed + bytes:byte(1) + bytes:byte(2) * 256 +
+                   bytes:byte(3) * 65536 + bytes:byte(4) * 16777216
+        end
+    end
+    math.randomseed(seed)
+end
 
-local policy_enabled = false
+-- UCB-based strategy seeding policy. Disabled by default: the only code
+-- paths that consume it are policy_pick_strategy + policy_seed_strategy,
+-- both of which early-return when this flag is false. Before 2026-04-18
+-- the telemetry_{load,record,write}_event stack ran regardless of this
+-- flag — a pure cost (each circular outcome appended to an in-memory
+-- map and was flushed to telemetry.tsv every 5 s). On Keenetic-class
+-- boxes this was ~5-15 MB of otherwise-dead state plus constant small
+-- flash writes. Gated now: when policy_enabled is false, the whole
+-- telemetry subsystem is a no-op.
+--
+-- Opt-in via Z2K_POLICY=1 env when a user wants to experiment with
+-- UCB-based seeding without editing code.
+local policy_enabled = (tonumber(os.getenv("Z2K_POLICY") or "0") or 0) == 1
 local policy_epsilon = 0.15
 local policy_cooldown_sec = 120
 local policy_ucb_c = 0.65
@@ -70,6 +107,17 @@ local function normalize_hostkey_for_state(hostkey)
   return string.lower(s)
 end
 
+local function hostkey_matches(a, b)
+  if is_blank(a) or is_blank(b) then return false end
+  a = normalize_hostkey_for_state(a)
+  b = normalize_hostkey_for_state(b)
+  if is_blank(a) or is_blank(b) then return false end
+  if a == b then return true end
+  if #a > #b and a:sub(-(#b + 1)) == ("." .. b) then return true end
+  if #b > #a and b:sub(-(#a + 1)) == ("." .. a) then return true end
+  return false
+end
+
 local function can_read_file(path)
   local f = io.open(path, "r")
   if not f then return false end
@@ -85,9 +133,13 @@ local function can_append_existing_file(path)
   return true
 end
 
+-- Note on TOCTOU: this check is a best-effort early bailout only.
+-- Actual write safety is guaranteed by acquire_lock() + write-to-tmp + os.rename().
+-- If permissions change between this check and the write, the rename will fail
+-- gracefully and pending_write will be set for retry.
 local function can_replace_file_via_parent_dir(path)
   if is_blank(path) then return false end
-  local dir = tostring(path):match("^(.*)[/\\][^/\\]+$")
+  local dir = tostring(path):match("^(.*)/[^/]+$")
   if is_blank(dir) then return false end
 
   local probe = string.format(
@@ -219,6 +271,187 @@ local function merge_state_file_into(path, dest)
   f:close()
 end
 
+local function restore_probe_saved(saved)
+  if not saved or not saved.hrec then return end
+  if saved.had_prev then
+    saved.hrec.nstrategy = saved.prev
+  else
+    saved.hrec.nstrategy = nil
+  end
+end
+
+local function clear_probe_saved(askey, hostn, restore)
+  if is_blank(askey) or is_blank(hostn) then return end
+  local hosts = probe_override_saved[askey]
+  if not hosts then return end
+  local saved = hosts[hostn]
+  if saved and restore then
+    restore_probe_saved(saved)
+  end
+  hosts[hostn] = nil
+  if next(hosts) == nil then
+    probe_override_saved[askey] = nil
+  end
+end
+
+local function restore_all_probe_saved()
+  for askey, hosts in pairs(probe_override_saved) do
+    for hostn, saved in pairs(hosts) do
+      restore_probe_saved(saved)
+      hosts[hostn] = nil
+    end
+    probe_override_saved[askey] = nil
+  end
+end
+
+local function restore_stale_probe_saved(cutoff_ts)
+  if not cutoff_ts then return end
+  for askey, hosts in pairs(probe_override_saved) do
+    for hostn, saved in pairs(hosts) do
+      local ts = tonumber(saved and saved.ts) or 0
+      if ts > 0 and ts <= cutoff_ts then
+        restore_probe_saved(saved)
+        hosts[hostn] = nil
+      end
+    end
+    if next(hosts) == nil then
+      probe_override_saved[askey] = nil
+    end
+  end
+end
+
+local function load_probe_overrides()
+  probe_overrides = {}
+  local f = io.open(PROBE_OVERRIDE_FILE, "r")
+  if not f then
+    restore_all_probe_saved()
+    probe_override_loaded_at = now_f()
+    return
+  end
+
+  local now_i = tonumber(os.time() or 0) or 0
+  for line in f:lines() do
+    if line ~= "" and not line:match("^%s*#") then
+      local askey, host, strat, ts, op =
+        line:match("^([^\t]+)\t([^\t]+)\t([0-9]+)\t?([0-9]*)\t?([^\t]*)")
+      local n = tonumber(strat)
+      local tsn = tonumber(ts) or 0
+      local fresh = true
+      if now_i > 0 and tsn > 0 and (now_i - tsn) > PROBE_OVERRIDE_MAX_AGE then
+        fresh = false
+      end
+      if fresh and askey and host and n and n >= 1 then
+        local hn = normalize_hostkey_for_state(host)
+        if hn then
+          table.insert(probe_overrides, {
+            askey = tostring(askey),
+            host = hn,
+            strategy = n,
+            ts = tsn,
+            op = (op ~= "" and op) or "probe",
+          })
+        end
+      end
+    end
+  end
+  f:close()
+  if now_i > 0 then
+    restore_stale_probe_saved(now_i - PROBE_OVERRIDE_MAX_AGE)
+  end
+  probe_override_loaded_at = now_f()
+end
+
+local function get_probe_overrides()
+  local t = now_f()
+  local ttl = (type(clock_getfloattime) == "function") and PROBE_OVERRIDE_TTL or 1.0
+  if probe_override_loaded_at < 0 or (t - probe_override_loaded_at) >= ttl then
+    load_probe_overrides()
+  end
+  return probe_overrides
+end
+
+local function get_probe_override(askey, hostn)
+  if is_blank(askey) or is_blank(hostn) then return nil end
+  local best = nil
+  for _, rec in ipairs(get_probe_overrides()) do
+    if rec.askey == tostring(askey) and hostkey_matches(rec.host, hostn) then
+      if (not best) or ((tonumber(rec.ts) or 0) >= (tonumber(best.ts) or 0)) then
+        best = rec
+      end
+    end
+  end
+  return best
+end
+
+local function probe_saved_host(askey, hostn, create)
+  if is_blank(askey) or is_blank(hostn) then return nil end
+  local a = probe_override_saved[askey]
+  if not a then
+    if not create then return nil end
+    a = {}
+    probe_override_saved[askey] = a
+  end
+  local h = a[hostn]
+  if not h and create then
+    h = {}
+    a[hostn] = h
+  end
+  return h
+end
+
+local function probe_commit_key(rec)
+  if not rec then return "" end
+  return tostring(rec.askey or "") .. "\t" ..
+         tostring(rec.host or "") .. "\t" ..
+         tostring(rec.strategy or "") .. "\t" ..
+         tostring(rec.ts or "")
+end
+
+local function probe_commit_already_seen(rec)
+  local key = probe_commit_key(rec)
+  if key == "" then return true end
+  return probe_commit_seen[key] and true or false
+end
+
+local function mark_probe_commit_seen(rec)
+  local key = probe_commit_key(rec)
+  if key ~= "" then probe_commit_seen[key] = true end
+end
+
+local function apply_probe_override(askey, hostn, hrec)
+  if not askey or not hostn or not hrec then return nil end
+  local rec = get_probe_override(askey, hostn)
+  local saved = probe_saved_host(askey, hostn, false)
+
+  if rec and rec.strategy then
+    if rec.op == "commit" then
+      if not probe_commit_already_seen(rec) then
+        hrec.nstrategy = rec.strategy
+        mark_probe_commit_seen(rec)
+      end
+      clear_probe_saved(askey, hostn, false)
+      return { active = true, commit = true, strategy = rec.strategy }
+    end
+
+    if not saved then
+      saved = probe_saved_host(askey, hostn, true)
+      saved.had_prev = hrec.nstrategy ~= nil
+      saved.prev = hrec.nstrategy
+    end
+    saved.hrec = hrec
+    saved.ts = tonumber(rec.ts) or tonumber(os.time() or 0) or 0
+    hrec.nstrategy = rec.strategy
+    return { active = true, strategy = rec.strategy }
+  end
+
+  if saved then
+    clear_probe_saved(askey, hostn, true)
+    return { restored = true }
+  end
+
+  return nil
+end
+
 local function create_empty_telemetry_file(path)
   local f = io.open(path, "w")
   if not f then return false end
@@ -311,54 +544,6 @@ local function load_state()
   merge_state_file_into(STATE_FILE_FALLBACK, state)
 end
 
-local MAX_ENTRIES_PER_KEY = 500
-
-local function evict_state_entries(merged)
-  for askey, hosts in pairs(merged) do
-    local count = 0
-    for _ in pairs(hosts) do count = count + 1 end
-    if count > MAX_ENTRIES_PER_KEY then
-      -- Collect entries with timestamps, sort by ts ascending, remove oldest
-      local entries = {}
-      for hostn, rec in pairs(hosts) do
-        table.insert(entries, { hostn = hostn, ts = (rec and rec.ts) or 0 })
-      end
-      table.sort(entries, function(a, b) return a.ts < b.ts end)
-      local to_remove = count - MAX_ENTRIES_PER_KEY
-      for i = 1, to_remove do
-        hosts[entries[i].hostn] = nil
-      end
-    end
-  end
-end
-
-local function evict_telemetry_entries(merged)
-  for askey, hosts in pairs(merged) do
-    local count = 0
-    for _ in pairs(hosts) do count = count + 1 end
-    if count > MAX_ENTRIES_PER_KEY then
-      -- Collect entries with total attempts, sort by att ascending, remove lowest
-      local entries = {}
-      for hostn, strats in pairs(hosts) do
-        local att = 0
-        if type(strats) == "table" then
-          for _, rec in pairs(strats) do
-            if rec then
-              att = att + (tonumber(rec.ok) or 0) + (tonumber(rec.fail) or 0)
-            end
-          end
-        end
-        table.insert(entries, { hostn = hostn, att = att })
-      end
-      table.sort(entries, function(a, b) return a.att < b.att end)
-      local to_remove = count - MAX_ENTRIES_PER_KEY
-      for i = 1, to_remove do
-        hosts[entries[i].hostn] = nil
-      end
-    end
-  end
-end
-
 local function acquire_lock(path)
   local lockfile = path .. ".lock"
   -- Check for stale lock (older than 10 seconds)
@@ -447,9 +632,6 @@ local function write_state()
     end
   end
 
-  -- Evict oldest entries if any key exceeds MAX_ENTRIES_PER_KEY
-  evict_state_entries(merged_state)
-
   local f = io.open(tmp, "w")
   if not f then
     pending_write = true
@@ -469,7 +651,6 @@ local function write_state()
   end
 
   f:close()
-  os.remove(path) -- Windows requires removing target before rename
   local ok, err = os.rename(tmp, path)
   if not ok then
     DLOG("ERROR: rename %s -> %s failed: %s\n", tmp, path, tostring(err))
@@ -510,6 +691,7 @@ local function telemetry_rec(askey, hostn, strategy, create)
 end
 
 local function load_telemetry()
+  if not policy_enabled then return end
   if telemetry_loaded then return end
   telemetry_loaded = true
   telemetry = {}
@@ -522,6 +704,7 @@ local function load_telemetry()
 end
 
 local function write_telemetry()
+  if not policy_enabled then return end
   local now = now_f()
   if now ~= 0 and (now - last_telemetry_write) < telemetry_write_interval then
     return
@@ -575,9 +758,6 @@ local function write_telemetry()
     end
   end
 
-  -- Evict entries with lowest total attempts if any key exceeds MAX_ENTRIES_PER_KEY
-  evict_telemetry_entries(merged)
-
   local f = io.open(tmp, "w")
   if not f then
     release_lock(lockfile)
@@ -605,7 +785,6 @@ local function write_telemetry()
     end
   end
   f:close()
-  os.remove(path) -- Windows requires removing target before rename
   local ok, err = os.rename(tmp, path)
   if not ok then
     DLOG("ERROR: rename %s -> %s failed: %s\n", tmp, path, tostring(err))
@@ -632,6 +811,7 @@ local function telemetry_is_cooldown(rec, now)
 end
 
 local function telemetry_record_event(askey, hostn, strategy, success, latency_s, now)
+  if not policy_enabled then return end
   local r = telemetry_rec(askey, hostn, strategy, true)
   if not r then return end
   if success then
@@ -743,9 +923,21 @@ local function flow_finish(desync)
   return nil, s
 end
 
+-- Whitelist of allowed global hostkey function names
+local allowed_hostkey_funcs = {
+  standard_hostkey = true,
+  nld_hostkey = true,
+  sld_hostkey = true,
+  tld_hostkey = true,
+}
+
 local function get_hostkey_func(desync)
   if desync and desync.arg and desync.arg.hostkey then
     local fname = tostring(desync.arg.hostkey)
+    if not allowed_hostkey_funcs[fname] then
+      debug_log("get_hostkey_func: rejected non-whitelisted function: " .. fname)
+      return nil
+    end
     local f = _G[fname]
     if type(f) == "function" then
       return f
@@ -979,18 +1171,45 @@ local function policy_seed_strategy(desync, askey, hostn, hrec)
   return pick, score
 end
 
+-- Returns 5 values: nocheck, failure, neutral_observed, reason, reason_detail.
+-- The latter three are populated by z2k-detectors.lua's classifier (will
+-- land in commit 4) and consumed below to gate successful_state /
+-- response_state and to enrich debug_log with the reason a detector
+-- decision was made.
+--
+-- Default to false/nil — pre-commit-4 detectors don't set z2k_neutral_*
+-- fields, and the gates below collapse harmlessly to current behaviour.
 local function conn_record_flags(desync)
   local tr = desync and desync.track
   local ls = tr and tr.lua_state
   local crec = ls and ls.automate
-  if not crec then return false, false end
-  return (crec.nocheck and true or false), (crec.failure and true or false)
+  if not crec then return false, false, false, nil, nil end
+  return (crec.nocheck and true or false),
+         (crec.failure and true or false),
+         (crec.z2k_neutral_observed and true or false),
+         crec.z2k_reason,
+         crec.z2k_reason_detail
 end
 
+-- True only for incoming events that count as a real-success signal.
+-- TLS ServerHello → always positive (handshake reached the server).
+-- HTTP reply → must be classified as "positive" by z2k_classify_http_reply
+-- (defined in z2k-detectors.lua, loaded earlier in the --lua-init chain).
+-- Neutral 4xx/5xx replies and cross-SLD redirects without markers must NOT
+-- pin the strategy as successful. Falls back to liberal old behaviour if
+-- the helper isn't loaded (init-order race in tests / hand-run nfqws).
 local function has_positive_incoming_response(desync)
   if not desync or desync.outgoing then return false end
   local p = desync.l7payload
-  return p == "tls_server_hello" or p == "http_reply"
+  if p == "tls_server_hello" then return true end
+  if p == "http_reply" then
+    if type(z2k_classify_http_reply) == "function" then
+      local class = z2k_classify_http_reply(desync)
+      return class == "positive"
+    end
+    return true
+  end
+  return false
 end
 
 local function should_debug_key(askey)
@@ -1044,115 +1263,13 @@ end
 
 -- Keyword-based block page detection (fallback when SLD check is unavailable).
 -- Catches DPI block pages by ISP-specific patterns in Location header or body.
-local function z2k_http_block_reply(payload)
-  if type(payload) ~= "string" then return false end
-  local code_s = payload:match("^HTTP/%d%.%d%s+([0-9][0-9][0-9])")
-  local code = tonumber(code_s)
-  if not code then return false end
-
-  -- Unambiguous block status codes
-  if code == 403 or code == 451 then
-    return true
-  end
-
-  -- Any redirect with block-indicating keywords in Location
-  if code == 301 or code == 302 or code == 303 or code == 307 or code == 308 then
-    local low = string.lower(payload)
-    if low:find("\r\nlocation:", 1, true) then
-      if low:find("block", 1, true) or
-         low:find("forbidden", 1, true) or
-         low:find("zapret", 1, true) or
-         low:find("rkn", 1, true) or
-         low:find("lawfilter", 1, true) or
-         low:find("restrict", 1, true) or
-         low:find("vigruzki", 1, true) or
-         low:find("eais", 1, true) or
-         low:find("warning", 1, true) or
-         low:find("blackhole", 1, true) then
-        return true
-      end
-    end
-  end
-  return false
-end
-
--- SLD-based redirect detection: any redirect (301/302/303/307/308) to a
--- different second-level domain is a DPI redirect. This is the most universal
--- check — works for any ISP regardless of their block page URL patterns.
--- standard_failure_detector only checks 302/307; we extend to all codes.
-local function z2k_http_dpi_redirect(desync)
-  if not desync or desync.outgoing then return false end
-  if desync.l7payload ~= "http_reply" then return false end
-  if not desync.track or not desync.track.hostname then return false end
-  if type(http_dissect_reply) ~= "function" then return false end
-  if type(array_field_search) ~= "function" then return false end
-  if type(is_dpi_redirect) ~= "function" then return false end
-
-  local hdis = http_dissect_reply(desync.dis.payload)
-  if not hdis then return false end
-  local c = hdis.code
-  -- 302/307 are already caught by standard_failure_detector, but re-checking
-  -- them here is harmless (crec.nocheck prevents double-counting) and makes
-  -- this function self-contained.
-  if c ~= 301 and c ~= 302 and c ~= 303 and c ~= 307 and c ~= 308 then
-    return false
-  end
-  local idx = array_field_search(hdis.headers, "header_low", "location")
-  if not idx then return false end
-  return is_dpi_redirect(desync.track.hostname, hdis.headers[idx].value)
-end
-
-function z2k_tls_alert_fatal(desync, crec)
-  if type(standard_failure_detector) == "function" then
-    local ok, res = pcall(standard_failure_detector, desync, crec)
-    if ok and res then return true end
-  end
-
-  if not desync or desync.outgoing then return false end
-  local dis = desync.dis
-
-  -- RST and FIN are handled by standard_failure_detector (RST within inseq=4K,
-  -- retransmissions within maxseq=32K). We do NOT extend these checks because:
-  -- - DPI sends RST early (within first few hundred bytes), already covered
-  -- - FIN is normal TCP close, NOT a DPI signal. Short connections (TLS 1.3
-  --   session resumption + small API response < 4K) would cause false positives:
-  --   success_detector (inseq=4K) hasn't fired yet when FIN arrives, so the
-  --   failure detector runs and counts normal connection close as failure.
-  --   With fails=2, two short API calls within 60s = false rotation.
-
-  -- HTTP DPI redirect: ISP redirects to block page (e.g. lawfilter.ertelecom.ru).
-  -- SLD-based check is universal for any ISP; keyword-based is a fallback.
-  if z2k_http_dpi_redirect(desync) then
-    return true
-  end
-  local payload = dis and dis.payload
-  if z2k_http_block_reply(payload) then
-    return true
-  end
-
-  -- TLS fatal alert (e.g. Cloudflare ECH handshake_failure)
-  if type(payload) ~= "string" then return false end
-  if #payload < 7 then return false end
-  if payload:byte(1) ~= 0x15 then return false end -- TLS record: alert (21)
-  if payload:byte(6) ~= 0x02 then return false end -- alert level: fatal (2)
-  return true
-end
-
--- Conservative success detector for TCP profiles.
--- Detects success but does NOT reset host failure counters.
--- This is important for TV clients: successful handshakes from other devices
--- on the same domain must not mask repeated webOS failures.
-function z2k_success_no_reset(desync, crec)
-  if type(standard_success_detector) ~= "function" then return false end
-  local ok, result = pcall(standard_success_detector, desync, crec)
-  if ok and result then
-    if crec then
-      crec.nocheck = true
-    end
-    return false
-  end
-  return false
-end
+-- NOTE (Phase 4 refactor): z2k_http_block_reply, z2k_http_dpi_redirect,
+-- z2k_tls_alert_fatal, z2k_tls_stalled, z2k_success_no_reset and their
+-- supporting state (Z2K_TLS_STALLED_SEC, z2k_tls_stalled_host_ts) used to
+-- live here. They moved to files/lua/z2k-detectors.lua which is now
+-- loaded via --lua-init=@... BEFORE this file, so the global detector
+-- functions exist by name when the circular wrapper below resolves them
+-- via circular:failure_detector=<name>.
 
 -- Wrap circular() from zapret-auto.lua.
 if type(circular) == "function" then
@@ -1161,12 +1278,14 @@ if type(circular) == "function" then
     local askey_before, hostn_before, hrec_before
     local policy_pick_before, policy_score_before
     local silent_rotate_from_before, silent_rotate_to_before, silent_attempts_before
+    local probe_override_before
     pcall(function()
       askey_before, hostn_before, hrec_before = get_record_for_desync(desync, true)
       if hrec_before then
         silent_rotate_from_before, silent_rotate_to_before, silent_attempts_before =
           maybe_rotate_youtube_silent_retry(desync, askey_before, hostn_before, hrec_before)
         policy_pick_before, policy_score_before = policy_seed_strategy(desync, askey_before, hostn_before, hrec_before)
+        probe_override_before = apply_probe_override(askey_before, hostn_before, hrec_before)
         flow_start_if_needed(desync, hrec_before.nstrategy)
       end
     end)
@@ -1189,7 +1308,7 @@ if type(circular) == "function" then
       end
       if not hrec then return end
 
-      local nocheck_after, failure_after = conn_record_flags(desync)
+      local nocheck_after, failure_after, neutral_after, reason_after, reason_detail_after = conn_record_flags(desync)
       local n_after = hrec and tonumber(hrec.nstrategy) or nil
       flow_start_if_needed(desync, n_after)
 
@@ -1204,8 +1323,15 @@ if type(circular) == "function" then
 
       -- Persist whenever circular is in a known-good state.
       -- This is intentionally broader than only first success transition to avoid missing saves.
-      local successful_state = nocheck_after and (not failure_after)
-      local response_state = has_positive_incoming_response(desync) and (not failure_after)
+      --
+      -- 3-state observability: detectors may set crec.z2k_neutral_observed
+      -- to mark a response as suspicious-but-not-confirmed (e.g. plain
+      -- 4xx without RU-DPI body markers, cross-SLD redirect without
+      -- block markers). Such flows must NOT pin the strategy as
+      -- successful — we only want positive confirmations to bake
+      -- pins into state.tsv.
+      local successful_state = nocheck_after and (not failure_after) and (not neutral_after)
+      local response_state = has_positive_incoming_response(desync) and (not failure_after) and (not neutral_after)
       -- QUIC flows may not reliably trigger success detector, but nstrategy>1 already indicates
       -- that circular has rotated this host. Persist that candidate for QUIC keys.
       local quic_candidate_state =
@@ -1225,7 +1351,9 @@ if type(circular) == "function" then
       local success_event = successful_state or response_state or quic_candidate_state
       local failure_event = failure_after and (not success_event)
       local persisted = false
-      if success_event or outgoing_initial then
+      local probe_active = probe_override_before and probe_override_before.active and
+        (not probe_override_before.commit)
+      if (success_event or outgoing_initial) and not probe_active then
         persisted = persist_if_changed(askey, hostn, hrec)
       end
 
@@ -1246,7 +1374,11 @@ if type(circular) == "function" then
         write_state()
       end
 
-      local debug_event = persisted or failure_after or success_event or failure_event or outgoing_initial or (policy_pick_before ~= nil)
+      -- Include neutral_after / reason_after so detector-flagged neutral
+      -- events surface in debug.log even when no fail/success/persist
+      -- fires. Without this we lose visibility into the new "downgraded"
+      -- class introduced by the 3-state classifier.
+      local debug_event = persisted or failure_after or success_event or failure_event or outgoing_initial or (policy_pick_before ~= nil) or neutral_after or (reason_after ~= nil)
       if debug_event and (should_debug_key(askey_before) or should_debug_key(askey_after)) then
         local track = desync and desync.track
         local hn = track and track.hostname or ""
@@ -1272,6 +1404,9 @@ if type(circular) == "function" then
           " silent_rotate_to=" .. tostring(silent_rotate_to_before or "") ..
           " success_event=" .. tostring(success_event and 1 or 0) ..
           " failure_event=" .. tostring(failure_event and 1 or 0) ..
+          " neutral=" .. tostring(neutral_after and 1 or 0) ..
+          " reason=" .. tostring(reason_after or "") ..
+          " reason_detail=" .. tostring(reason_detail_after or "") ..
           " latency_s=" .. tostring(latency_s or "") ..
           " persisted=" .. tostring(persisted and 1 or 0)
         )
