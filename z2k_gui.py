@@ -53,6 +53,7 @@ BASE_ARGS = [
     "--lua-init=@lua/z2k-range-rand.lua",
     "--lua-init=@lua/z2k-autocircular.lua",
     "--lua-init=@lua/z2k-modern-core.lua",
+    "--lua-init=@lua/z2k-http-strats.lua",
     "--lua-init=@lua/z2k-dynamic-strategy.lua",
     "--blob=quic_google:files/quic_initial_www_google_com.bin",
     "--blob=quic_rutracker:files/quic_initial_rutracker_org.bin",
@@ -73,6 +74,7 @@ BASE_ARGS = [
     "--blob=tls_clienthello_activated:files/tls_clienthello_activated.bin",
     "--blob=tls_clienthello_gosuslugi_ru:files/tls_clienthello_gosuslugi_ru.bin",
     "--blob=tls_clienthello_www_onetrust_com:files/tls_clienthello_www_onetrust_com.bin",
+    "--blob=tls_clienthello_ucoz_ru_tls13:files/tls_clienthello_ucoz_ru_tls13.bin",
     "--blob=t2:files/t2.bin",
     "--blob=zero_256:files/zero_256.bin",
     "--blob=http_iana:files/http_iana_org.bin",
@@ -82,7 +84,7 @@ BASE_ARGS = [
     "--wf-raw-part=@windivert.filter/windivert_part.quic_initial_ietf.txt",
 ]
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 
 # ─── UAC ─────────────────────────────────────────────────────────────────────
 

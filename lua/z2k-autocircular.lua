@@ -11,22 +11,28 @@
 -- - We do NOT change rotation logic; only persist/restore.
 -- - Storage key uses `desync.arg.key` when provided; otherwise falls back to `desync.func_instance`.
 
+-- z2w (Windows) path adaptation: STATE_DIR rooted at cwd (cache/autocircular),
+-- fallback base = %TEMP%. Both env overrides из z2k-enhanced сохраняются для
+-- совместимости юнит-тестов.
 local function z2w_tmp_path(name)
   local base = os.getenv("TEMP") or os.getenv("TMP") or "."
   return base .. "/" .. name
 end
-
-local STATE_DIR_PRIMARY = "cache/autocircular"
+local STATE_DIR_PRIMARY = os.getenv("Z2K_AUTOCIRCULAR_DIR_OVERRIDE")
+                          or "cache/autocircular"
+local _fallback_base    = os.getenv("Z2K_AUTOCIRCULAR_FALLBACK_OVERRIDE")
+                          or (os.getenv("TEMP") or os.getenv("TMP") or ".")
 local STATE_FILE_PRIMARY = STATE_DIR_PRIMARY .. "/state.tsv"
-local STATE_FILE_FALLBACK = z2w_tmp_path("z2k-autocircular-state.tsv")
+local STATE_FILE_FALLBACK = _fallback_base .. "/z2k-autocircular-state.tsv"
 local TELEMETRY_FILE_PRIMARY = STATE_DIR_PRIMARY .. "/telemetry.tsv"
-local TELEMETRY_FILE_FALLBACK = z2w_tmp_path("z2k-autocircular-telemetry.tsv")
+local TELEMETRY_FILE_FALLBACK = _fallback_base .. "/z2k-autocircular-telemetry.tsv"
 local DEBUG_FLAG_PRIMARY = STATE_DIR_PRIMARY .. "/debug.flag"
-local DEBUG_FLAG_FALLBACK = z2w_tmp_path("z2k-autocircular-debug.flag")
+local DEBUG_FLAG_FALLBACK = _fallback_base .. "/z2k-autocircular-debug.flag"
 local DEBUG_LOG_PRIMARY = STATE_DIR_PRIMARY .. "/debug.log"
-local DEBUG_LOG_FALLBACK = z2w_tmp_path("z2k-autocircular-debug.log")
+local DEBUG_LOG_FALLBACK = _fallback_base .. "/z2k-autocircular-debug.log"
 local RKN_SILENT_FLAG = STATE_DIR_PRIMARY .. "/rkn_silent_fallback.flag"
-local PROBE_OVERRIDE_FILE = z2w_tmp_path("z2k-probe-override.tsv")
+local PROBE_OVERRIDE_FILE = os.getenv("Z2K_PROBE_OVERRIDE")
+                            or z2w_tmp_path("z2k-probe-override.tsv")
 local PROBE_OVERRIDE_TTL = 0.05
 local PROBE_OVERRIDE_MAX_AGE = 300
 
@@ -1019,9 +1025,45 @@ end
 
 local policy_explore_good = 0.03  -- exploration chance when current strategy is working (3%)
 local youtube_silent_retry_window_sec = 120
-local youtube_silent_retry_min_gap_sec = 2
+-- min_gap_sec was 2, bumped to 5 on 2026-05-03 after field-debug на тестовом
+-- роутере (master) и KeyFire (enhanced/МГТС): функция трактовала любые два
+-- tls_client_hello к одному хосту в окне 120 сек, разнесённые на >=2 сек,
+-- как silent-drop retry — но HLS-чанки YouTube/Reels идут каждые 1-2 сек,
+-- prefetch и parallel sub-connections тоже укладываются в этот gap. Итог:
+-- на каждом видео nstrategy ползёт +1..+N даже когда стратегия работает
+-- (HTTP 200 наблюдаемо), reset post-call не успевает за pre-call rotation.
+-- Реальный browser/TLS-stack retry после silent drop приходит через 3-5+
+-- секунд, поэтому 5-секундный порог отсекает легитимные fast-flow паттерны
+-- и сохраняет защиту от настоящих silent-drop'ов. Если field-сигналы
+-- покажут пропуск real-retry — нужна telemetry-aware проверка cur_rate
+-- (как в policy_seed_strategy:1131-1146), но для TCP-profile telemetry
+-- часто пустая (incoming не доходит до lua), поэтому начинаем с порога.
+local youtube_silent_retry_min_gap_sec = 5
 local youtube_silent_retry_threshold = 2
 local youtube_silent_retry = {}
+
+-- D.5a (2026-05-16): cross-profile success bypass для silent_retry, чтобы
+-- TCH-burst при HTTP/3 Alt-Svc negotiation не крутил страту вперёд, пока
+-- параллельный QUIC-flow по тому же hostname реально работает.
+--
+-- last_seen_success_by_hostn[hostn][source_askey] = ts.
+--   Обновляется только на real-success (successful_state OR response_state).
+--   quic_candidate_state НЕ годится — он fires на любом outgoing quic_initial с
+--   nstrategy>1, без incoming-сигнала, и марк будет вечно self-refreshing.
+--
+-- silent_retry_compat_map[target_askey] = source_askey:
+--   target — это askey у которого мы рассматриваем silent_retry для bypass'a.
+--   source — это askey, success которого мы принимаем как доказательство, что
+--   обход на хосте жив. Только совместимые пары: yt_tcp ↔ yt_quic; http_rkn
+--   ИЛИ http-success на :80 не подтверждает TLS-обход на :443.
+--
+-- silent_retry_bypass_window_sec = 30s: после окна без свежего success
+-- silent_retry оживает обратно (для случая, когда обход реально проседает).
+local last_seen_success_by_hostn = {}
+local silent_retry_bypass_window_sec = 30
+local silent_retry_compat_map = {
+  yt_tcp = "yt_quic",
+}
 
 local function refresh_rkn_silent_enabled()
   local now = os.time() or 0
@@ -1084,6 +1126,22 @@ local function maybe_rotate_youtube_silent_retry(desync, askey, hostn, hrec)
   local now = now_f()
   local r = youtube_silent_retry_rec(askey, hostn, true)
   if not r then return nil, nil, nil end
+
+  -- D.5a: cross-profile success bypass. Если на этом hostn у совместимого
+  -- профиля недавно был real-success — обход реально жив (просто клиент ушёл
+  -- на HTTP/3 после Alt-Svc), не крутим. Чистим stale attempts/last_t, чтобы
+  -- первый TCH после истечения окна не догнал старый счётчик до threshold
+  -- мгновенно (см. review point 3).
+  local compat_src = silent_retry_compat_map[askey]
+  if compat_src and hostn then
+    local bucket = last_seen_success_by_hostn[hostn]
+    local last_ts = bucket and bucket[compat_src]
+    if last_ts and (now - last_ts) >= 0 and (now - last_ts) < silent_retry_bypass_window_sec then
+      r.attempts = 0
+      r.last_t = 0
+      return nil, nil, nil
+    end
+  end
 
   local gap = now - (tonumber(r.last_t) or 0)
   if tonumber(r.strategy) == cur and gap >= youtube_silent_retry_min_gap_sec and gap <= youtube_silent_retry_window_sec then
@@ -1271,14 +1329,44 @@ end
 -- functions exist by name when the circular wrapper below resolves them
 -- via circular:failure_detector=<name>.
 
+-- allow_nohost support: при `--lua-desync=circular:...:allow_nohost=1` и
+-- отсутствии реального hostname в desync.track (nil/empty/IP literal с
+-- hostname_is_ip=true) подменяем track.hostname на стабильный sentinel
+-- "nohost" перед orig_circular, восстанавливаем после. Это даёт
+-- standard_hostkey стабильный hostkey вместо fallback'а на host_ip(desync)
+-- → shared rotation state per-askey для hostless flows (Discord UDP DTLS
+-- handshake без SNI). См. PLAN_orchestrator_replacement.md B1.
+local function nohost_setup(desync)
+  local arg = desync and desync.arg
+  local allow_nohost = arg and (arg.allow_nohost == "1" or arg.allow_nohost == 1)
+  if not (allow_nohost and desync.track) then return false, nil end
+  local h = desync.track.hostname
+  local has_real_hostname = h and #h > 0 and not desync.track.hostname_is_ip
+  if has_real_hostname then return false, nil end
+  local saved = h
+  desync.track.hostname = "nohost"
+  return true, saved
+end
+
+local function nohost_restore(desync, nohost_active, saved_hostname)
+  if nohost_active and desync.track then
+    desync.track.hostname = saved_hostname  -- nil либо original value
+  end
+end
+
 -- Wrap circular() from zapret-auto.lua.
 if type(circular) == "function" then
   local orig_circular = circular
   circular = function(ctx, desync)
+    local nohost_active, saved_hostname = nohost_setup(desync)
+
     local askey_before, hostn_before, hrec_before
     local policy_pick_before, policy_score_before
     local silent_rotate_from_before, silent_rotate_to_before, silent_attempts_before
     local probe_override_before
+    -- DO NOT remove this inner pcall: pre-block errors (telemetry/persist setup,
+    -- policy seed) must stay swallowed — existing contract. Изменение этого
+    -- сломает nfqws desync path при любой ошибке в нашей бухгалтерии.
     pcall(function()
       askey_before, hostn_before, hrec_before = get_record_for_desync(desync, true)
       if hrec_before then
@@ -1289,8 +1377,17 @@ if type(circular) == "function" then
         flow_start_if_needed(desync, hrec_before.nstrategy)
       end
     end)
-    local verdict = orig_circular(ctx, desync)
-    pcall(function()
+
+    -- Wrap orig_circular в pcall ТОЛЬКО для finally-restore hostname'а перед
+    -- propagation'ом error'а в nfqws. Pre/post-block errors остаются swallowed
+    -- их inner pcall'ами (existing contract).
+    local ok, verdict_or_err = pcall(orig_circular, ctx, desync)
+    local verdict
+    if ok then
+      verdict = verdict_or_err
+      -- DO NOT remove this inner pcall: post-block errors (telemetry record,
+      -- persist_if_changed, debug_log) must stay swallowed — existing contract.
+      pcall(function()
       local askey_after, hostn_after, hrec_after
       pcall(function()
         askey_after, hostn_after, hrec_after = get_record_for_desync(desync, false)
@@ -1361,6 +1458,33 @@ if type(circular) == "function" then
         reset_youtube_silent_retry(askey, hostn)
       end
 
+      -- D.5a: mark hostn как имеющий свежий real-success для этого askey,
+      -- чтобы силент-ретрай совместимого target-профиля мог скипнуть
+      -- ротацию. Используем только incoming-side сигналы:
+      --   - response_state: positive incoming reply (per-call, не latched);
+      --   - successful_state: nocheck-path, но ТОЛЬКО на incoming пакете.
+      --
+      -- Важно гард `not desync.outgoing` у successful_state: nocheck_after
+      -- берётся из crec.nocheck (latched после первого incoming success
+      -- в upstream zapret-auto.lua); без гарда любой последующий outgoing
+      -- callback того же flow держит маркер свежим, и контракт «через
+      -- silent_retry_bypass_window_sec без свежего success silent_retry
+      -- оживает» ломается (см. review High 2026-05-16).
+      --
+      -- quic_candidate_state не годится (out-of-band, fires на outgoing
+      -- quic_initial с nstrategy>1, ничего incoming не подтверждает).
+      local real_success_incoming =
+        response_state or
+        ((not (desync and desync.outgoing)) and successful_state)
+      if real_success_incoming and hostn and askey then
+        local bucket = last_seen_success_by_hostn[hostn]
+        if not bucket then
+          bucket = {}
+          last_seen_success_by_hostn[hostn] = bucket
+        end
+        bucket[askey] = now_f()
+      end
+
       local latency_s, flow_strategy = nil, nil
       if success_event or failure_event then
         latency_s, flow_strategy = flow_finish(desync)
@@ -1412,6 +1536,42 @@ if type(circular) == "function" then
         )
       end
     end)
+    end  -- if ok then post-block
+
+    -- Finally: restore hostname ВСЕГДА (success или error path).
+    nohost_restore(desync, nohost_active, saved_hostname)
+
+    if not ok then
+      -- Re-throw сообщение orig_circular'а. level=0 значит "не добавлять
+      -- 'circular.lua:N: ' prefix" — error пойдёт с original text как если
+      -- бы pcall не было.
+      error(verdict_or_err, 0)
+    end
     return verdict
   end
+end
+
+-- Test hooks. Активны только под Z2K_TEST_MODE=1, в production ничего не
+-- экспортируют. Дают unit-тестам прямой доступ к module-local bookkeeping
+-- (silent_retry / cross-profile marker), чтобы проверять инварианты без
+-- "нащупывания" через full circular() pipeline.
+if os.getenv("Z2K_TEST_MODE") == "1" then
+  _G._z2k_autocircular_test = {
+    maybe_rotate_youtube_silent_retry = maybe_rotate_youtube_silent_retry,
+    last_seen_success_by_hostn = last_seen_success_by_hostn,
+    youtube_silent_retry = youtube_silent_retry,
+    silent_retry_bypass_window_sec = silent_retry_bypass_window_sec,
+    silent_retry_compat_map = silent_retry_compat_map,
+    youtube_silent_retry_window_sec = youtube_silent_retry_window_sec,
+    youtube_silent_retry_min_gap_sec = youtube_silent_retry_min_gap_sec,
+    youtube_silent_retry_threshold = youtube_silent_retry_threshold,
+    reset = function()
+      for k in pairs(last_seen_success_by_hostn) do
+        last_seen_success_by_hostn[k] = nil
+      end
+      for k in pairs(youtube_silent_retry) do
+        youtube_silent_retry[k] = nil
+      end
+    end,
+  }
 end

@@ -22,6 +22,25 @@ vkcdn.net
 userapi.com
 vk.ru
 vkvideo.ru
+mvk.com
+vk.cc
+vk.link
+vk-cdn.net
+vk-portal.net
+vk-apps.com
+vk-streaming.com
+vkpay.com
+vkpay.ru
+vkuser.net
+vkuseraudio.com
+vkuseraudio.net
+vkuservideo.com
+vkuservideo.net
+vkuserlive.com
+vkuserlive.net
+vkforms.com
+vkforms.ru
+vkmessenger.com
 ok.ru
 mycdn.me
 rutube.ru
@@ -180,3 +199,6 @@ keenetic.link
 # === Разработка ===
 raw.githubusercontent.com
 marketplace.visualstudio.com
+
+# === Oracle Cloud Infrastructure ===
+customer-oci.com

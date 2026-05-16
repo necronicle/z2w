@@ -498,6 +498,14 @@ function z2k_tls_stalled(desync, crec)
       local hs_len  = p:byte(8) * 256 + p:byte(9)
       if rec_len + 5 <= #p and hs_len + 4 <= rec_len then
         z2k_tls_stalled_host_ts[key] = nil
+        -- ServerHello validated → этого flow handshake начался, но это
+        -- ещё **не** доказательство, что поток достиг application phase.
+        -- ТСПУ может пропустить SH и заглушить server flight (Cert / EE /
+        -- Finished) — z2k_silent_drop_detector должен продолжать ловить
+        -- этот scenario. Marker z2k_handshake_seen ставится только при
+        -- более сильном success-сигнале (positive HTTP reply в
+        -- z2k_http_success_positive_only); для HTTPS path silent_drop
+        -- использует bytes_in bypass (см. описание там).
       end
     end
     return false
@@ -639,7 +647,7 @@ end
 -- stays in lua_state so a later FIN can be observed correctly.
 
 local Z2K_MID_STREAM_LO               = 8000
-local Z2K_MID_STREAM_HI               = 18000
+local Z2K_MID_STREAM_HI               = 26000
 local Z2K_MID_STREAM_SILENCE_SEC      = 5
 local Z2K_MID_STREAM_RETRY_MAX_SEC    = 120
 local Z2K_MID_STREAM_ACTIVE_RETRY_SEC = 30
@@ -885,6 +893,245 @@ function z2k_mid_stream_stall(desync, crec)
   return false
 end
 
+-- HTTP mid-stream stall detector (mirror z2k_mid_stream_stall на HTTP path).
+--
+-- Что ловит: handshake-фаза не релевантна для HTTP (нет TLS), но та же
+-- pattern stall'а — сервер отдал ~14-30KB body, потом стрим тихо встаёт
+-- без RST/FIN/alert. По треду ntc.party 22516 (#1, #3) реальный диапазон
+-- HTTP stall'а 24-32 KB, чуть выше TLS-варианта.
+--
+-- Differences from z2k_mid_stream_stall (TLS):
+--   * Gate signal: incoming `http_reply` (не tls_server_hello/handshake);
+--     outgoing retry — `http_req` (не tls_client_hello).
+--   * Constants: LO=14000 / HI=32000 (TLS было 8000/26000 — HTTP отдаёт
+--     больше bytes в первой инициальной burst'е до stall'а).
+--   * State scope: per-flow в `desync.track.lua_state.http_mid_stream`,
+--     per-key в module-global `z2k_http_mid_stream_state`. Отдельные
+--     карты от TLS чтобы parallel TLS+HTTP к тому же SLD не пересекались.
+--   * Inherits z2k_tls_alert_fatal (общий fail signal — RST / TLS alert /
+--     HTTP block-marker classifier).
+--
+-- Mid-stream key через standard_hostkey() (nld=2 aggregation), как у TLS.
+-- Multi-candidate map per key (8 max), ownership via flow_id.
+
+local Z2K_HTTP_MID_STREAM_LO               = 14000
+local Z2K_HTTP_MID_STREAM_HI               = 32000
+local Z2K_HTTP_MID_STREAM_SILENCE_SEC      = 5
+local Z2K_HTTP_MID_STREAM_RETRY_MAX_SEC    = 120
+local Z2K_HTTP_MID_STREAM_ACTIVE_RETRY_SEC = 30
+local Z2K_HTTP_MID_STREAM_MAX_CANDIDATES   = 8
+local z2k_http_mid_stream_state = {}
+local z2k_http_mid_stream_insert_counter = 0
+local z2k_http_mid_stream_flow_seq = 0
+
+local function z2k_http_mid_stream_new_key_state()
+  return {
+    candidates = {},
+    last_req_ts = 0,
+  }
+end
+
+local function z2k_http_mid_stream_new_flow_state()
+  z2k_http_mid_stream_flow_seq = z2k_http_mid_stream_flow_seq + 1
+  return {
+    base_seq         = nil,
+    max_seq          = 0,
+    last_progress_ts = 0,
+    fin_seen         = false,
+    flow_id          = z2k_http_mid_stream_flow_seq,
+  }
+end
+
+local function z2k_http_mid_stream_ts_of(v)
+  if type(v) ~= "table" then return 0 end
+  local newest = tonumber(v.last_req_ts) or 0
+  local cands = v.candidates
+  if type(cands) == "table" then
+    for _, c in pairs(cands) do
+      local t = (type(c) == "table" and tonumber(c.last_progress_ts)) or 0
+      if t > newest then newest = t end
+    end
+  end
+  return newest
+end
+
+local function z2k_http_mid_stream_maybe_evict()
+  z2k_http_mid_stream_insert_counter = z2k_http_mid_stream_insert_counter + 1
+  if z2k_http_mid_stream_insert_counter < Z2K_DETECTOR_EVICT_INTERVAL then return end
+  z2k_http_mid_stream_insert_counter = 0
+  local n = 0
+  for _ in pairs(z2k_http_mid_stream_state) do n = n + 1 end
+  if n <= Z2K_DETECTOR_MAP_MAX then return end
+  z2k_detector_evict_oldest(z2k_http_mid_stream_state, Z2K_DETECTOR_EVICT_BATCH, z2k_http_mid_stream_ts_of)
+end
+
+local function z2k_http_mid_stream_oldest_candidate_id(cands)
+  local oldest_id, oldest_ts
+  for fid, c in pairs(cands) do
+    local ts = (type(c) == "table" and tonumber(c.last_progress_ts)) or 0
+    if not oldest_ts or ts < oldest_ts then
+      oldest_id, oldest_ts = fid, ts
+    end
+  end
+  return oldest_id
+end
+
+local function z2k_http_mid_stream_publish_candidate(key_st, flow_st)
+  local cands = key_st.candidates
+  local existing = cands[flow_st.flow_id]
+  if existing then
+    existing.max_seq          = flow_st.max_seq
+    existing.last_progress_ts = flow_st.last_progress_ts
+    return
+  end
+  local count = 0
+  for _ in pairs(cands) do count = count + 1 end
+  if count >= Z2K_HTTP_MID_STREAM_MAX_CANDIDATES then
+    local victim = z2k_http_mid_stream_oldest_candidate_id(cands)
+    if victim then cands[victim] = nil end
+  end
+  cands[flow_st.flow_id] = {
+    max_seq          = flow_st.max_seq,
+    last_progress_ts = flow_st.last_progress_ts,
+  }
+end
+
+local function z2k_http_mid_stream_clear_all_candidates(cands)
+  for fid in pairs(cands) do
+    cands[fid] = nil
+  end
+end
+
+function z2k_http_mid_stream_stall(desync, crec)
+  -- Inherit RST / TLS alert / HTTP block-marker fail signals.
+  if type(z2k_tls_alert_fatal) == "function" then
+    local ok, res = pcall(z2k_tls_alert_fatal, desync, crec)
+    if ok and res then return true end
+  end
+
+  if not desync then return false end
+  local host = desync.track and desync.track.hostname
+  if not host or host == "" then return false end
+  local now = os.time and os.time() or 0
+  if now == 0 then return false end
+
+  local lua_state = desync.track.lua_state
+  if type(lua_state) ~= "table" then return false end
+
+  local flow_st = lua_state.http_mid_stream
+  if type(flow_st) ~= "table" then
+    flow_st = z2k_http_mid_stream_new_flow_state()
+    lua_state.http_mid_stream = flow_st
+  end
+
+  local key = z2k_mid_stream_flow_key(desync, host)
+  local key_st = z2k_http_mid_stream_state[key]
+  if not key_st then
+    key_st = z2k_http_mid_stream_new_key_state()
+    z2k_http_mid_stream_state[key] = key_st
+    z2k_http_mid_stream_maybe_evict()
+  end
+
+  -- Incoming http_reply — track byte progress and FIN/RST.
+  if not desync.outgoing and desync.l7payload == "http_reply" then
+    local dis = desync.dis
+    if not dis or not dis.tcp then return false end
+
+    local flags = tonumber(dis.tcp.th_flags) or 0
+    local fin_bit = (TH_FIN and bitand(flags, TH_FIN)) or 0
+    local rst_bit = (TH_RST and bitand(flags, TH_RST)) or 0
+    if fin_bit ~= 0 or rst_bit ~= 0 then
+      flow_st.fin_seen = true
+      key_st.candidates[flow_st.flow_id] = nil
+      return false
+    end
+
+    if type(dis.payload) ~= "string" or #dis.payload == 0 then
+      return false
+    end
+    local seq = tonumber(dis.tcp.th_seq)
+    if not seq then return false end
+
+    if not flow_st.base_seq then flow_st.base_seq = seq end
+    local rel = (seq - flow_st.base_seq) + #dis.payload
+    if rel > flow_st.max_seq then
+      flow_st.max_seq = rel
+      flow_st.last_progress_ts = now
+    end
+
+    if flow_st.max_seq > Z2K_HTTP_MID_STREAM_HI then
+      key_st.candidates[flow_st.flow_id] = nil
+      return false
+    end
+
+    if flow_st.max_seq >= Z2K_HTTP_MID_STREAM_LO then
+      z2k_http_mid_stream_publish_candidate(key_st, flow_st)
+    end
+    return false
+  end
+
+  -- Incoming non-http_reply (other payloads on same TCP — e.g. control
+  -- packets) — игнорируем для byte tracking, но FIN/RST всё равно
+  -- закроет flow.
+  if not desync.outgoing then
+    local dis = desync.dis
+    if dis and dis.tcp then
+      local flags = tonumber(dis.tcp.th_flags) or 0
+      local fin_bit = (TH_FIN and bitand(flags, TH_FIN)) or 0
+      local rst_bit = (TH_RST and bitand(flags, TH_RST)) or 0
+      if fin_bit ~= 0 or rst_bit ~= 0 then
+        flow_st.fin_seen = true
+        key_st.candidates[flow_st.flow_id] = nil
+      end
+    end
+    return false
+  end
+
+  -- Outgoing http_req — retry signal. Scan candidates for fire match.
+  if desync.outgoing and desync.l7payload == "http_req" then
+    local prev_req_ts = key_st.last_req_ts
+    key_st.last_req_ts = now
+
+    local cands = key_st.candidates
+    if next(cands) == nil then return false end
+
+    local req_gap = (prev_req_ts > 0) and (now - prev_req_ts) or math.huge
+    if req_gap > Z2K_HTTP_MID_STREAM_ACTIVE_RETRY_SEC then
+      z2k_http_mid_stream_clear_all_candidates(cands)
+      return false
+    end
+
+    local fire_fid, fire_cand, fire_silence
+    for fid, cand in pairs(cands) do
+      local since_progress = now - cand.last_progress_ts
+      if since_progress > Z2K_HTTP_MID_STREAM_RETRY_MAX_SEC then
+        cands[fid] = nil
+      elseif (not fire_fid)
+             and cand.max_seq >= Z2K_HTTP_MID_STREAM_LO
+             and cand.max_seq <= Z2K_HTTP_MID_STREAM_HI
+             and since_progress >= Z2K_HTTP_MID_STREAM_SILENCE_SEC then
+        fire_fid     = fid
+        fire_cand    = cand
+        fire_silence = since_progress
+      end
+    end
+
+    if not fire_fid then return false end
+
+    if type(DLOG) == "function" then
+      DLOG("z2k_http_mid_stream_stall: key=" .. key
+           .. " host=" .. host
+           .. " max_seq=" .. fire_cand.max_seq
+           .. " silence=" .. fire_silence .. "s"
+           .. " req_gap=" .. req_gap .. "s — counting as fail")
+    end
+    cands[fire_fid] = nil
+    return true
+  end
+
+  return false
+end
+
 -- Conservative success detector for TCP profiles.
 -- Detects success but does NOT reset host failure counters.
 -- This is important for TV clients: successful handshakes from other devices
@@ -935,6 +1182,37 @@ function z2k_http_success_positive_only(desync, crec)
      type(z2k_classify_http_reply) == "function" then
     local class, reason = z2k_classify_http_reply(desync)
     if class == "positive" then
+      -- Content-Length-aware: на cdnbase.com и подобных CDN-static с
+      -- ТСПУ body-cap первый http_reply packet — это headers + первая
+      -- часть body. Continuation packets идут как payload_type=unknown
+      -- и НЕ вызывают lua-callback вообще, так что мы не сможем поймать
+      -- truncation на runtime. НО мы можем проверить здесь:
+      -- если headers содержат Content-Length=X, и body в этом первом
+      -- packet'е < X — это не самодостаточный success, full body ещё
+      -- идёт continuation packets'ами, и мы НЕ ЗНАЕМ дойдёт ли он до
+      -- конца. Откладываем success-сигнал → autocircular не committed.
+      -- При retry/refresh клиента silent_drop_detector сделает свою
+      -- работу (out=4 in=0 → failure → ротация).
+      local payload = desync.dis and desync.dis.payload
+      if type(payload) == "string" and #payload > 0 then
+        local cl = string.match(payload, "[Cc]ontent%-[Ll]ength:%s*(%d+)")
+        if cl then
+          local expected = tonumber(cl) or 0
+          local body_pos = string.find(payload, "\r\n\r\n", 1, true)
+          local body_in_packet = 0
+          if body_pos then body_in_packet = #payload - (body_pos + 3) end
+          if expected > 0 and body_in_packet < expected then
+            DLOG("z2k_http_success_positive_only: defer "..(desync.track and desync.track.hostname or "?")..
+                 " — first packet body "..body_in_packet.."/"..expected.." (continuation pending)")
+            return false
+          end
+        end
+      end
+      -- Positive HTTP reply = flow established. Same rationale as the
+      -- validated-ServerHello marker in z2k_tls_stalled: stop
+      -- packet-count failure detectors from false-positiving on later
+      -- bursts of pipelined requests / keep-alive traffic.
+      if crec then crec.z2k_handshake_seen = true end
       return true
     end
     if class == "neutral" or class == "hard_fail" then
@@ -949,4 +1227,225 @@ function z2k_http_success_positive_only(desync, crec)
   if type(standard_success_detector) ~= "function" then return false end
   local ok, result = pcall(standard_success_detector, desync, crec)
   return ok and result == true
+end
+
+-- ----------------------------------------------------------------------------
+-- z2k_silent_drop_detector — packet-count-based detection of silent ТСПУ drop.
+-- Ported from github.com/ALFiX01/GoodbyeZapret/blob/main/Project/bin/lua/silent-drop-detector.lua
+--
+-- Идея: ТСПУ может silent-drop'ать pakets без отправки RST/FIN/Alert. У нас
+-- content-based детекторы (z2k_tls_alert_fatal, z2k_*_mid_stream_stall) этот
+-- кейс не ловят — они смотрят на TLS alert или byte-stream stall, а silent drop
+-- происходит на уровне «никаких данных вообще не приходит». autocircular ждёт
+-- timeout, теряет 60+ секунд на пустую попытку.
+--
+-- silent_drop_detector считает outgoing data-packets vs incoming. Если клиент
+-- отправил >= tcp_out=4 data-пакетов (после ClientHello/HTTP request), а получил
+-- только handshake responses (in_count <= tcp_in=1, что значит SYN-ACK без data) —
+-- это silent drop. Сигнал failure → autocircular ротирует на следующую strategy.
+--
+-- Для http_rkn / rkn_tcp / yt_tcp arms: подключается как failure_detector.
+-- Внутри делегирует к existing detector chain (z2k_http_mid_stream_stall или
+-- z2k_tls_alert_fatal) если silent-drop signal не сработал — чтобы оба покрытия
+-- работали одновременно.
+--
+-- Args (через :failure_detector_args=:tcp_out=N:tcp_in=M:bytes_in_handshake_done=B, опц.):
+--   tcp_out                  — outgoing data packets threshold (default 4)
+--   tcp_in                   — incoming data packets threshold (default 1, только SYN-ACK)
+--   bytes_in_handshake_done  — incoming bytes порог, после которого считаем
+--                              TLS handshake достаточно завершённым, чтобы
+--                              silent-drop check пропускать (default 3072).
+--
+-- Field-debug 2026-05-14 на instagram.com (test router 192.168.1.1, rkn_tcp,
+-- HTTPS/HTTP-2 multiplexing): успешный TLS handshake (validated ServerHello,
+-- latency CH→SH ~75ms), strategy технически работает, но приложение шлёт
+-- 4+ outgoing TLS app-data packet'ов burst'ом до прихода первого application-
+-- layer response — `pdcounter direct` пересекает 4, `pdcounter reverse` всё
+-- ещё 1 (только сам SH). Detector стрелял на каждом burst'е, autocircular
+-- ротировал стратегию хотя реального silent drop'а не было. На сессии 295
+-- raise'ов: 220 строк с failure=1 nocheck=1, карусель strategy 10→15 на
+-- полностью рабочем обходе.
+--
+-- Fix — два независимых bypass'а, оба локальны к silent-drop ветке:
+--
+-- 1. crec.z2k_handshake_seen — application-layer success marker, ставится
+--    только z2k_http_success_positive_only при positive 2xx/3xx HTTP reply.
+--    Это сильный сигнал: server действительно вернул application data,
+--    дальнейшие out>>in burst'ы нормальный keep-alive / pipelined traffic.
+--    На validated ServerHello marker **не** ставится — ТСПУ может пройти
+--    SH и заглушить server flight (Cert / EE / Finished), такой scenario
+--    silent_drop должен продолжать ловить.
+--
+-- 2. in_bytes ≥ bytes_in_handshake_done (default 3072) — реверсивный
+--    bytes-counter, показывающий что server flight уже доставил Cert +
+--    EncryptedExtensions + Finished (типичный flight ≥ 2-3KB для public
+--    CA chain). При этом TLS handshake достоверно завершён, out>>in
+--    multiplexing нормален. SH-only stall (incoming ~120-200B << 3KB)
+--    через этот bypass **не** проходит — silent_drop продолжает fire'ить
+--    и закрывает gap, на который z2k_mid_stream_stall ещё не реагирует
+--    (его кандидат появляется только при in_bytes ≥ 8000).
+--
+-- Chain делегирование (z2k_mid_stream_stall, z2k_http_mid_stream_stall,
+-- z2k_http_partial_response, z2k_tls_stalled, z2k_tls_alert_fatal) ниже
+-- выполняется **всегда** независимо от silent-drop bypass'ов — post-
+-- handshake real mid-stream stall / fatal alerts остаются под покрытием.
+--
+-- Packet-count threshold contract (4+ out, <=1 in) сохранён: маленькие
+-- HTTP GET / TLS retransmits (4 packet'а по ~400B) до handshake'а
+-- продолжают fire'ить как было.
+function z2k_silent_drop_detector(desync, crec, arg)
+  if crec and crec.nocheck then return false end
+
+  local tcp_out_thr      = (arg and tonumber(arg.tcp_out))                 or 4
+  local tcp_in_thr       = (arg and tonumber(arg.tcp_in))                  or 1
+  local handshake_done_b = (arg and tonumber(arg.bytes_in_handshake_done)) or 3072
+
+  if desync.dis and desync.dis.tcp and desync.outgoing
+     and desync.track and desync.track.pos then
+    local out_count = (desync.track.pos.direct  and desync.track.pos.direct.pdcounter)  or 0
+    local in_count  = (desync.track.pos.reverse and desync.track.pos.reverse.pdcounter) or 0
+    local in_bytes  = (desync.track.pos.reverse and desync.track.pos.reverse.pbcounter) or 0
+
+    local handshake_seen_marker  = crec and crec.z2k_handshake_seen
+    local server_flight_complete = in_bytes >= handshake_done_b
+
+    if not handshake_seen_marker and not server_flight_complete
+       and out_count >= tcp_out_thr and in_count <= tcp_in_thr then
+      DLOG("z2k_silent_drop_detector: FAILURE out="..out_count.." in="..in_count..
+           " in_bytes="..in_bytes)
+      return true
+    end
+  end
+
+  -- Не silent drop — делегируем chain ко всем существующим detectors.
+  -- Каждый сам быстро вернёт false если payload не его (TLS vs HTTP).
+  -- Порядок: TLS-stream → HTTP-stream → TLS-handshake-stalled → TLS-alert.
+  -- z2k_mid_stream_stall (TLS) и z2k_http_mid_stream_stall (HTTP) — byte-window
+  -- detectors. z2k_tls_stalled — CH-without-SH window (rkn_tcp default).
+  -- z2k_tls_alert_fatal — final fallback с HTTP classifier и TLS-alert chain.
+  local function try(fn)
+    if type(fn) == "function" then
+      local ok, result = pcall(fn, desync, crec, arg)
+      if ok and result == true then return true end
+    end
+    return false
+  end
+  if try(z2k_mid_stream_stall) then return true end
+  if try(z2k_http_mid_stream_stall) then return true end
+  if try(z2k_http_partial_response) then return true end
+  if try(z2k_tls_stalled) then return true end
+  if try(z2k_tls_alert_fatal) then return true end
+  return false
+end
+
+
+-- ----------------------------------------------------------------------------
+-- z2k_http_partial_response — ловит ТСПУ HTTP body cap (silent truncation):
+-- сервер обещает Content-Length=X, реально доходит ~X/3 (типичный 16-30KB cap),
+-- existing detectors пропускают потому что 200 status получен и data приходит
+-- (нет stall signal). Этот detector сравнивает advertised CL vs received bytes
+-- per-key, при partial mismatch >15% triggers failure → autocircular ротирует.
+--
+-- DEBUG: это re-port после field-fail. Все path'ы log'ируются через DLOG
+-- так что при включённом --debug=1 в /opt/zapret2/extra_strats/cache/
+-- autocircular/nfqws2.debug.log будет полная trace.
+-- ----------------------------------------------------------------------------
+
+local Z2K_PARTIAL_DEFICIT_PCT = 15
+local Z2K_PARTIAL_MIN_EXPECTED = 8000
+local Z2K_PARTIAL_STATE_CAP = 256
+local z2k_partial_resp_state = {}
+local z2k_partial_resp_state_count = 0
+
+local function z2k_partial_state_evict_one()
+  if z2k_partial_resp_state_count <= Z2K_PARTIAL_STATE_CAP then return end
+  local oldest_key, oldest_ts = nil, math.huge
+  for k, v in pairs(z2k_partial_resp_state) do
+    if (v.last_seen or 0) < oldest_ts then
+      oldest_key = k
+      oldest_ts = v.last_seen or 0
+    end
+  end
+  if oldest_key then
+    z2k_partial_resp_state[oldest_key] = nil
+    z2k_partial_resp_state_count = z2k_partial_resp_state_count - 1
+  end
+end
+
+function z2k_http_partial_response(desync, crec)
+  if not desync or not desync.dis or not desync.dis.tcp then
+    if b_debug then DLOG("partial_resp: skip — no tcp dissect") end
+    return false
+  end
+  if crec and crec.nocheck then
+    if b_debug then DLOG("partial_resp: skip — crec.nocheck") end
+    return false
+  end
+
+  local host = desync.track and desync.track.hostname
+  if not host or host == "" then
+    if b_debug then DLOG("partial_resp: skip — no hostname") end
+    return false
+  end
+
+  local now = (os and os.time and os.time()) or 0
+  local key = host
+  local st = z2k_partial_resp_state[key]
+
+  if desync.outgoing and desync.l7payload == "http_req" then
+    if b_debug then DLOG("partial_resp: outgoing http_req for "..host.." (st.expected="..tostring(st and st.expected).." st.received="..tostring(st and st.received)..")") end
+    if st and st.expected > Z2K_PARTIAL_MIN_EXPECTED and st.received > 0 then
+      local got_pct = math.floor((st.received * 100) / st.expected)
+      local deficit = 100 - got_pct
+      local prev_e = st.expected
+      local prev_r = st.received
+      st.expected = 0
+      st.received = 0
+      st.last_seen = now
+      if deficit >= Z2K_PARTIAL_DEFICIT_PCT then
+        DLOG("z2k_http_partial_response: FAIL "..host.." got "..prev_r.."/"..prev_e.." (-"..deficit.."%)")
+        return true
+      else
+        if b_debug then DLOG("partial_resp: ok "..host.." got "..prev_r.."/"..prev_e.." (-"..deficit.."%)") end
+      end
+    end
+    return false
+  end
+
+  if not desync.outgoing and desync.l7payload == "http_reply" then
+    local payload = desync.dis.payload
+    if type(payload) ~= "string" or #payload == 0 then
+      if b_debug then DLOG("partial_resp: skip — empty incoming payload "..host) end
+      return false
+    end
+    if not st then
+      st = { expected = 0, received = 0, last_seen = now }
+      z2k_partial_resp_state[key] = st
+      z2k_partial_resp_state_count = z2k_partial_resp_state_count + 1
+      z2k_partial_state_evict_one()
+    end
+    st.last_seen = now
+
+    if st.expected == 0 then
+      local cl = string.match(payload, "[Cc]ontent%-[Ll]ength:%s*(%d+)")
+      if cl then
+        st.expected = tonumber(cl) or 0
+        local body_pos = string.find(payload, "\r\n\r\n", 1, true)
+        if body_pos then
+          st.received = #payload - (body_pos + 3)
+        else
+          st.received = 0
+        end
+        DLOG("partial_resp: "..host.." Content-Length="..st.expected.." first-payload-body="..st.received)
+      else
+        if b_debug then DLOG("partial_resp: "..host.." incoming http_reply WITHOUT Content-Length header") end
+      end
+    else
+      st.received = st.received + #payload
+      if b_debug then DLOG("partial_resp: "..host.." continuation, received="..st.received.."/"..st.expected) end
+    end
+    return false
+  end
+
+  return false
 end
