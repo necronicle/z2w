@@ -121,11 +121,42 @@
     setBusy(false);
   });
 
+  // ── Telegram tunnel state ─────────────────────────────────
+  // The backend drives this via window.onTgState(state, msg) where state ∈
+  // {starting, running, error, stopped}. We just reflect it visually.
+  const setTgState = (state, msg) => {
+    tgRow.classList.remove("is-running", "is-connecting", "is-error");
+    switch (state) {
+      case "starting":
+        tgRow.classList.add("is-connecting");
+        tgSub.textContent = "запуск туннеля…";
+        break;
+      case "running":
+        tgRow.classList.add("is-running");
+        tgSub.textContent = "туннель активен";
+        break;
+      case "error":
+        tgRow.classList.add("is-error");
+        tgSub.textContent = msg || "ошибка туннеля";
+        tgToggle.checked = false;  // reflect backend giving up
+        break;
+      case "stopped":
+      default:
+        tgSub.textContent = "Прозрачный прокси через VPS";
+        break;
+    }
+  };
+
+  window.onTgState = (state, msg) => setTgState(state, msg);
+
   tgToggle.addEventListener("change", async () => {
-    await call("set_tg_enabled", tgToggle.checked);
-    tgSub.textContent = tgToggle.checked
-      ? "Прозрачный прокси — активен при старте"
-      : "Прозрачный прокси";
+    const want = tgToggle.checked;
+    setTgState(want ? "starting" : "stopped");
+    const res = await call("set_tg_enabled", want);
+    if (res && !res.ok) {
+      tgToggle.checked = false;
+      setTgState("error", res.err || "не удалось запустить");
+    }
   });
 
   rknToggle.addEventListener("change", async () => {
@@ -151,6 +182,15 @@
       tgRow.classList.add("is-disabled");
       tgSub.textContent = "tg-transparent.exe отсутствует";
       tgToggle.disabled = true;
+    } else if (st) {
+      tgToggle.checked = !!st.tg_enabled;
+      if (st.tg_running) {
+        setTgState("running");
+      } else if (st.tg_enabled) {
+        setTgState("starting");  // backend is autostarting
+      } else {
+        setTgState("stopped");
+      }
     }
     if (st && st.rkn_silent) rknToggle.checked = true;
     if (st && st.running) {

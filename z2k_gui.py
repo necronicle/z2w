@@ -13,9 +13,12 @@ from __future__ import annotations
 import collections
 import ctypes
 import os
+import socket
+import ssl
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
@@ -31,13 +34,32 @@ WINWS_EXE        = SCRIPT_DIR / "winws2.exe"
 PROFILES         = SCRIPT_DIR / "profiles.default.txt"
 RKN_SILENT_FLAG  = SCRIPT_DIR / "cache" / "autocircular" / "rkn_silent_fallback.flag"
 TG_PROXY_EXE     = SCRIPT_DIR / "tg-transparent.exe"
+TG_ENABLED_FLAG  = SCRIPT_DIR / "cache" / "tg_enabled.flag"    # persists toggle across restarts
 UI_INDEX         = RES_DIR / "ui" / "index.html"
 WINWS_LOG_FILE   = SCRIPT_DIR / "z2w-winws.log"      # current session log
 WINWS_LOG_OLD    = SCRIPT_DIR / "z2w-winws.log.1"    # previous rotation
 WINWS_LOG_CAP    = 2 * 1024 * 1024                   # 2 MB per file
+TG_LOG_FILE      = SCRIPT_DIR / "z2w-tg.log"
+TG_LOG_OLD       = SCRIPT_DIR / "z2w-tg.log.1"
 
 # How many trailing stderr lines to keep in RAM for crash-report popup.
 STDERR_TAIL_LINES = 80
+
+# ─── Telegram tunnel constants (mirroring z2k tg-tunnel-watchdog.sh) ──────────
+TG_CRASH_GRACE_SEC      = 1.5    # if proc dies < this after spawn → fatal
+TG_WATCHDOG_INTERVAL    = 60     # seconds between health checks
+TG_PROBE_HOST           = "core.telegram.org"
+TG_PROBE_IP             = "149.154.167.99"   # Telegram CDN, pinned to bypass DNS variance
+TG_PROBE_PORT           = 443
+TG_PROBE_TIMEOUT        = 8
+TG_PROBE_FAILS_FOR_RESTART = 3   # consecutive failures (~3min) → restart
+TG_RESTART_MIN_INTERVAL = 30     # seconds; never restart faster than this
+TG_RESTART_BUDGET       = 5      # max restarts...
+TG_RESTART_BUDGET_WIN   = 300    # ...within this many seconds
+TG_STDERR_FAIL_MARKERS  = (
+    "WinDivertOpen:", "WinDivertRecv:", "WinDivertSend:",
+    "fatal error:", "panic:",
+)
 
 VERSION = "1.4.1"
 
@@ -283,8 +305,18 @@ class Api:
         self.window = None
         self.process: subprocess.Popen | None = None
         self.stderr_drain: _StderrDrain | None = None
-        self.tg_proxy_proc: subprocess.Popen | None = None
-        self.tg_enabled = False
+
+        # Telegram tunnel state (independent of winws2 power button — mirrors
+        # z2k's S98tg-tunnel/cron-watchdog split where tg-tunnel lives outside
+        # of nfqws2's lifecycle).
+        self.tg_proc: subprocess.Popen | None = None
+        self.tg_stderr_drain: _StderrDrain | None = None
+        self.tg_enabled = TG_ENABLED_FLAG.exists()   # persisted across z2w restarts
+        self.tg_want_running = False                  # tracks user intent for watchdog
+        self.tg_watchdog_thread: threading.Thread | None = None
+        self.tg_probe_failures = 0
+        self._tg_restart_log: collections.deque = collections.deque(maxlen=TG_RESTART_BUDGET)
+        self._tg_lock = threading.Lock()
 
     # called from main()
     def attach(self, window) -> None:
@@ -298,10 +330,19 @@ class Api:
 
     def initial_state(self) -> dict:
         RKN_SILENT_FLAG.parent.mkdir(parents=True, exist_ok=True)
+        TG_ENABLED_FLAG.parent.mkdir(parents=True, exist_ok=True)
+        # If TG was enabled in a previous session, start it now (independent
+        # of the winws2 power button). Mirrors S98tg-tunnel autostart that
+        # respects TG_PROXY_USER_DISABLED=0 on boot.
+        if self.tg_enabled and self.tg_proc is None and TG_PROXY_EXE.exists():
+            threading.Thread(target=self._tg_start, daemon=True,
+                             name="tg-autostart").start()
         return {
             "version":      VERSION,
             "running":      self.running,
             "tg_available": TG_PROXY_EXE.exists(),
+            "tg_enabled":   self.tg_enabled,
+            "tg_running":   self._tg_alive(),
             "rkn_silent":   RKN_SILENT_FLAG.exists(),
         }
 
@@ -332,8 +373,8 @@ class Api:
         )
         self.stderr_drain.start()
 
-        if self.tg_enabled:
-            self._start_tg_proxy()
+        # TG tunnel is INDEPENDENT of winws2 lifecycle (mirrors z2k's split
+        # where S98tg-tunnel and S99zapret2 are separate init scripts).
         threading.Thread(target=self._watch, daemon=True).start()
         return {"ok": True}
 
@@ -352,16 +393,36 @@ class Api:
         # Drain thread exits naturally on stderr EOF (after the kill above).
         self.stderr_drain = None
         _kill_stale("winws2.exe")
-        self._stop_tg_proxy()
+        # TG is independent — power-off must NOT kill the tunnel.
         return {"ok": True}
 
     def set_tg_enabled(self, enabled: bool) -> dict:
-        self.tg_enabled = bool(enabled)
-        if self.running:
-            if self.tg_enabled and not self.tg_proxy_proc:
-                self._start_tg_proxy()
-            elif not self.tg_enabled and self.tg_proxy_proc:
-                self._stop_tg_proxy()
+        """User toggled TG. Independent of winws2 power state."""
+        want = bool(enabled)
+        self.tg_enabled = want
+        # Persist across z2w restarts (mirrors TG_PROXY_USER_DISABLED).
+        try:
+            TG_ENABLED_FLAG.parent.mkdir(parents=True, exist_ok=True)
+            if want:
+                TG_ENABLED_FLAG.write_text("1", encoding="utf-8")
+            else:
+                try:
+                    TG_ENABLED_FLAG.unlink()
+                except FileNotFoundError:
+                    pass
+        except OSError:
+            pass
+
+        if want:
+            if not TG_PROXY_EXE.exists():
+                self._tg_emit("error", "tg-transparent.exe не найден рядом с z2w.exe")
+                return {"ok": False, "err": "tg-transparent.exe не найден"}
+            # Spawn in background — UI doesn't wait for crash-grace.
+            threading.Thread(target=self._tg_start, daemon=True,
+                             name="tg-start").start()
+        else:
+            threading.Thread(target=self._tg_stop, daemon=True,
+                             name="tg-stop").start()
         return {"ok": True}
 
     def set_rkn_silent(self, enabled: bool) -> dict:
@@ -384,40 +445,212 @@ class Api:
 
     def close(self) -> None:
         self.stop()
+        # On app exit, ALWAYS stop the tunnel (regardless of tg_enabled flag).
+        # The flag remains set so next launch auto-starts.
+        self._tg_stop(persist=False)
         if self.window is not None:
             try:
                 self.window.destroy()
             except Exception:
                 pass
 
-    # ── internals ────────────────────────────────────────────
+    # ──────────────────────────────────────────────────────────
+    # ── Telegram tunnel: lifecycle + watchdog                ──
+    # ──────────────────────────────────────────────────────────
+    #
+    # Mirrors z2k's tg-tunnel pipeline:
+    #   - S98tg-tunnel    → _tg_start / _tg_stop
+    #   - watchdog cron   → _tg_watchdog (daemon thread, 60s tick)
+    #   - active probe    → _tg_probe (TLS to TG_PROBE_IP)
+    #   - restart logic   → _tg_restart with rate-limit + budget
+    #   - log mgmt        → _StderrDrain → z2w-tg.log (rolling, 2MB cap)
+    # ──────────────────────────────────────────────────────────
 
-    def _start_tg_proxy(self) -> None:
-        if not TG_PROXY_EXE.exists():
+    def _tg_alive(self) -> bool:
+        return self.tg_proc is not None and self.tg_proc.poll() is None
+
+    def _tg_emit(self, state: str, msg: str = "") -> None:
+        """Push state update to JS. state ∈ {starting, running, error, stopped}."""
+        if self.window is None:
             return
         try:
-            self.tg_proxy_proc = subprocess.Popen(
-                [str(TG_PROXY_EXE)],
-                cwd=str(SCRIPT_DIR),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=CREATE_NO_WINDOW,
+            self.window.evaluate_js(
+                f"window.onTgState && window.onTgState({_js_string(state)}, {_js_string(msg)})"
             )
         except Exception:
             pass
 
-    def _stop_tg_proxy(self) -> None:
-        if self.tg_proxy_proc is not None:
+    def _tg_start(self) -> None:
+        """Spawn tg-transparent.exe + start drain + spawn watchdog."""
+        with self._tg_lock:
+            if self._tg_alive():
+                return  # already running
+            if not TG_PROXY_EXE.exists():
+                self._tg_emit("error", "tg-transparent.exe не найден")
+                return
+
+            _unblock_files()
+            _kill_stale("tg-transparent.exe")  # clean any orphan
+
             try:
-                self.tg_proxy_proc.terminate()
-                self.tg_proxy_proc.wait(timeout=3)
+                self.tg_proc = subprocess.Popen(
+                    [str(TG_PROXY_EXE)],
+                    cwd=str(SCRIPT_DIR),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    bufsize=0,
+                    creationflags=CREATE_NO_WINDOW,
+                )
+            except Exception as exc:
+                self._tg_emit("error", f"Не удалось запустить tg-transparent: {exc}")
+                return
+
+            self.tg_stderr_drain = _StderrDrain(
+                self.tg_proc.stderr, TG_LOG_FILE, TG_LOG_OLD,
+            )
+            self.tg_stderr_drain.start()
+            self.tg_want_running = True
+            self.tg_probe_failures = 0
+
+        self._tg_emit("starting")
+
+        # Crash-grace check — if the process dies within TG_CRASH_GRACE_SEC,
+        # treat as fatal and surface the tail. Otherwise → running.
+        threading.Thread(target=self._tg_crash_check, daemon=True,
+                         name="tg-crash-check").start()
+
+        # Start watchdog if not already running.
+        if (self.tg_watchdog_thread is None
+                or not self.tg_watchdog_thread.is_alive()):
+            self.tg_watchdog_thread = threading.Thread(
+                target=self._tg_watchdog, daemon=True, name="tg-watchdog",
+            )
+            self.tg_watchdog_thread.start()
+
+    def _tg_stop(self, persist: bool = True) -> None:
+        """Kill tg-transparent + wind down. persist=True means user-stop
+        (tg_want_running cleared); persist=False is app-exit cleanup."""
+        with self._tg_lock:
+            if persist:
+                self.tg_want_running = False
+            proc = self.tg_proc
+            self.tg_proc = None
+            self.tg_stderr_drain = None
+        if proc is not None:
+            _kill_tree(proc.pid)
+            try:
+                proc.wait(timeout=5)
             except Exception:
                 try:
-                    self.tg_proxy_proc.kill()
+                    proc.kill()
                 except Exception:
                     pass
-            self.tg_proxy_proc = None
         _kill_stale("tg-transparent.exe")
+        self._tg_emit("stopped")
+
+    def _tg_crash_check(self) -> None:
+        """Detect immediate post-spawn crash and surface stderr tail."""
+        time.sleep(TG_CRASH_GRACE_SEC)
+        with self._tg_lock:
+            proc = self.tg_proc
+            drain = self.tg_stderr_drain
+        if proc is None:
+            return
+        if proc.poll() is None:
+            # alive — promote to "running"
+            self._tg_emit("running")
+            return
+        # Crashed during grace window — fatal.
+        if drain is not None:
+            drain.join(timeout=0.5)
+        tail = drain.tail(12) if drain else ""
+        with self._tg_lock:
+            self.tg_proc = None
+            self.tg_stderr_drain = None
+            self.tg_want_running = False  # don't loop-restart on immediate crash
+        msg = f"tg-transparent умер сразу после старта: {tail}" if tail \
+              else "tg-transparent умер сразу после старта (см. z2w-tg.log)"
+        self._tg_emit("error", msg)
+
+    def _tg_watchdog(self) -> None:
+        """Periodic health check. Identical contract to z2k-tg-watchdog.sh:
+           - process must be alive
+           - active TLS probe to Telegram must succeed (after 3 fails → restart)
+           - rate-limited restarts; budget exhausted → give up + report"""
+        while True:
+            time.sleep(TG_WATCHDOG_INTERVAL)
+            if not self.tg_want_running:
+                return  # user has stopped; watchdog exits
+
+            # 1. Process alive?
+            if not self._tg_alive():
+                self._tg_restart("process not running")
+                continue
+
+            # 2. CONNECT_FAIL / WinDivertOpen storm in stderr tail?
+            drain = self.tg_stderr_drain
+            if drain is not None:
+                tail = drain.tail(40)
+                hits = sum(1 for line in tail.splitlines()
+                           if any(m in line for m in TG_STDERR_FAIL_MARKERS))
+                if hits >= 10:
+                    self._tg_restart(f"stderr storm: {hits} fail markers in last 40 lines")
+                    continue
+
+            # 3. Active probe.
+            if self._tg_probe():
+                self.tg_probe_failures = 0
+                self._tg_emit("running")
+            else:
+                self.tg_probe_failures += 1
+                if self.tg_probe_failures >= TG_PROBE_FAILS_FOR_RESTART:
+                    self._tg_restart(
+                        f"active probe failed {self.tg_probe_failures}x in a row"
+                    )
+                    self.tg_probe_failures = 0
+
+    def _tg_probe(self) -> bool:
+        """TLS handshake to Telegram (TG_PROBE_HOST resolved to TG_PROBE_IP).
+        If WinDivert+tg-transparent are healthy, TG IP traffic goes through
+        the tunnel and succeeds. Failure = tunnel broken."""
+        try:
+            ctx = ssl.create_default_context()
+            with socket.create_connection(
+                    (TG_PROBE_IP, TG_PROBE_PORT),
+                    timeout=TG_PROBE_TIMEOUT) as sock:
+                with ctx.wrap_socket(sock, server_hostname=TG_PROBE_HOST) as tls:
+                    tls.do_handshake()
+                    return True
+        except Exception:
+            return False
+
+    def _tg_restart(self, reason: str) -> None:
+        """Rate-limited restart. Mirrors z2k-tg-watchdog.sh restart_tunnel()."""
+        now = time.time()
+        # Budget check: max TG_RESTART_BUDGET restarts within TG_RESTART_BUDGET_WIN.
+        while self._tg_restart_log and now - self._tg_restart_log[0] > TG_RESTART_BUDGET_WIN:
+            self._tg_restart_log.popleft()
+        if len(self._tg_restart_log) >= TG_RESTART_BUDGET:
+            with self._tg_lock:
+                self.tg_want_running = False
+            self._tg_emit("error",
+                          f"tg-transparent: {TG_RESTART_BUDGET} рестартов за "
+                          f"{TG_RESTART_BUDGET_WIN}с — даю отбой. См. z2w-tg.log")
+            return
+
+        if self._tg_restart_log and now - self._tg_restart_log[-1] < TG_RESTART_MIN_INTERVAL:
+            return  # too soon since last restart, skip this tick
+
+        self._tg_restart_log.append(now)
+        self._tg_emit("error", f"рестарт: {reason}")
+        # Tear down current proc cleanly; preserve tg_want_running.
+        self._tg_stop(persist=False)
+        # Brief settle, then bring up again. tg_want_running guards
+        # against starting after a user stop that raced with the watchdog.
+        time.sleep(1.0)
+        if self.tg_enabled:
+            self.tg_want_running = True
+            self._tg_start()
 
     def _watch(self) -> None:
         """Wait for winws2 to exit; if it crashed, push a JS notification."""

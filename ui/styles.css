@@ -549,6 +549,45 @@ body.is-on .chip-meta {
 .row.is-disabled { opacity: 0.4; }
 .row.is-disabled .switch { pointer-events: none; }
 
+/* ── Per-row state indicators (used by Telegram row) ─────── */
+
+.row.is-running .row-icon {
+  color: var(--accent-bright);
+  border-color: rgba(63,185,80,0.35);
+  background: linear-gradient(180deg, rgba(63,185,80,0.10), rgba(63,185,80,0.04));
+  box-shadow: inset 0 0 0 1px rgba(63,185,80,0.20),
+              0 0 12px -4px var(--accent-glow);
+}
+.row.is-running .row-sub { color: var(--accent); }
+
+.row.is-connecting .row-icon {
+  color: var(--warning);
+  border-color: rgba(240,180,41,0.30);
+  animation: rowConnPulse 1.4s var(--ease-soft) infinite;
+}
+.row.is-connecting .row-sub { color: var(--warning); }
+@keyframes rowConnPulse {
+  0%, 100% { box-shadow: inset 0 0 0 1px rgba(240,180,41,0.16); }
+  50%      { box-shadow: inset 0 0 0 1px rgba(240,180,41,0.32),
+                          0 0 12px -2px rgba(240,180,41,0.30); }
+}
+
+.row.is-error .row-icon {
+  color: var(--danger);
+  border-color: rgba(248,81,73,0.35);
+  background: rgba(248,81,73,0.06);
+}
+.row.is-error .row-sub {
+  color: #ffb4b0;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  /* Truncate long error messages on a single row */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+}
+
 /* WinUI3-style pill switch */
 
 .switch {
