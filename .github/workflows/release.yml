@@ -33,7 +33,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install pyinstaller pillow pywebview pywin32
+        run: pip install pyinstaller pillow pywebview pywin32 pystray
 
       - name: Verify profiles.default.txt matches generator output
         shell: pwsh
@@ -104,6 +104,49 @@ jobs:
           imgs[0].save('z2w.ico', format='ICO', append_images=imgs[1:])
           print('Icon created: z2w.ico')
 
+      - name: Smoke test winws2 + generated config
+        shell: pwsh
+        run: |
+          # Catches fork-side regressions (missing options, syntax breaks
+          # in profiles) BEFORE we ship a broken release. We simulate
+          # _write_winws_config() here, append --dry-run inside the
+          # config (since @<config_file> must be the only CLI arg), and
+          # invoke winws2.exe @config. Exit 0 = options recognized +
+          # syntax parses. Anything else fails the build.
+          $ErrorActionPreference = "Stop"
+          # Compose conf: BASE_ARGS lines + each non-comment profile line.
+          $py = @'
+          import re, shlex, sys
+          base = []
+          src = open("z2k_gui.py", encoding="utf-8").read()
+          m = re.search(r"BASE_ARGS = \[([\s\S]*?)\]\n", src)
+          ns = {}
+          exec("BASE_ARGS = [" + m.group(1) + "]", ns)
+          args = list(ns["BASE_ARGS"])
+          for line in open("profiles.default.txt", encoding="utf-8"):
+              line = line.strip()
+              if not line or line.startswith("#"):
+                  continue
+              args.extend(line.split())
+          # Append --dry-run so winws2 exits 0 after validating args.
+          args.append("--dry-run")
+          out = "\n".join(shlex.quote(a) for a in args) + "\n"
+          open("cache/winws2.smoke.conf", "w", encoding="utf-8", newline="\n").write(out)
+          print(f"smoke config: {len(out)} bytes, {len(args)} tokens")
+          '@
+          New-Item -ItemType Directory -Force cache | Out-Null
+          $py | Out-File -Encoding utf8 -NoNewline _smoke_build.py
+          python _smoke_build.py
+          Write-Host "Running winws2 --dry-run via @config..."
+          & .\winws2.exe "@cache/winws2.smoke.conf"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::winws2 rejected the generated config (exit $LASTEXITCODE)."
+            Write-Host "Likely a fork regression: an option in BASE_ARGS or profiles is not recognized by winws2.exe."
+            exit 1
+          }
+          Remove-Item -Force _smoke_build.py
+          Remove-Item -Force cache/winws2.smoke.conf
+
       - name: Build z2w.exe
         run: >
           pyinstaller
@@ -113,9 +156,11 @@ jobs:
           --name z2w
           --icon z2w.ico
           --add-data "ui;ui"
+          --add-data "z2w.ico;."
           --collect-data webview
           --collect-submodules webview
           --hidden-import clr_loader.types
+          --hidden-import pystray._win32
           z2k_gui.py
 
       - name: Package release

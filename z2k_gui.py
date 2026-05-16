@@ -336,6 +336,164 @@ def _unblock_files() -> None:
                 capture_output=True, creationflags=CREATE_NO_WINDOW,
             )
 
+# ─── System-tray manager (pystray + win32) ────────────────────────────────────
+
+class _TrayManager:
+    """Minimize-to-tray + restore at original position/monitor.
+
+    User clicks the titlebar minimize → window is hidden via Win32
+    ShowWindow(SW_HIDE) (NOT minimized to taskbar) and the tray icon
+    becomes visible. Position and size at the moment of hide are
+    captured via GetWindowRect; restore puts the window back at the
+    same (left, top, width, height) — Windows interprets those as
+    global desktop coordinates, so multi-monitor placement is preserved.
+
+    Tray UX (Windows convention):
+      - left-click on icon → restore (pystray's default action)
+      - right-click → menu: «Открыть», «Выход»
+    Double-click is treated identically to single-click since pystray's
+    Windows backend doesn't distinguish; for users who reach the tray
+    icon via overflow it's the standard pattern."""
+
+    def __init__(self, get_hwnd, on_quit) -> None:
+        self._get_hwnd = get_hwnd     # callable → HWND of the pywebview window
+        self._on_quit = on_quit        # callback for «Выход»
+        self._icon = None
+        self._thread: threading.Thread | None = None
+        self._saved_rect: tuple[int, int, int, int] | None = None
+        self._available = False
+        try:
+            import pystray  # noqa: F401
+            from PIL import Image  # noqa: F401
+            self._available = True
+        except Exception:
+            self._available = False
+
+    def is_running(self) -> bool:
+        return self._available and self._icon is not None
+
+    def start(self) -> None:
+        if not self._available:
+            return
+        import pystray
+        from PIL import Image, ImageDraw, ImageFilter
+
+        # Try bundled .ico first (release builds bundle it via PyInstaller
+        # --add-data). Fallback to inline-drawn icon so dev runs still work.
+        ico = None
+        for candidate in (RES_DIR / "z2w.ico", SCRIPT_DIR / "z2w.ico"):
+            if candidate.exists():
+                try:
+                    ico = Image.open(str(candidate))
+                    break
+                except Exception:
+                    ico = None
+        if ico is None:
+            ico = _draw_tray_icon_fallback()
+
+        menu = pystray.Menu(
+            pystray.MenuItem("Открыть", self._on_open, default=True),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Выход", self._on_quit_clicked),
+        )
+        self._icon = pystray.Icon("z2w", ico, "z2w — DPI bypass", menu)
+        self._thread = threading.Thread(
+            target=self._icon.run, daemon=True, name="tray",
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._icon is not None:
+            try:
+                self._icon.stop()
+            except Exception:
+                pass
+            self._icon = None
+
+    def hide_window_to_tray(self) -> None:
+        """Save window rect, hide via Win32 (not minimize), keep tray icon."""
+        hwnd = self._get_hwnd()
+        if not hwnd:
+            return
+        try:
+            import win32gui
+            import win32con
+        except Exception:
+            return
+        try:
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+            self._saved_rect = (left, top, right - left, bottom - top)
+            win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
+        except Exception:
+            pass
+
+    def _on_open(self, icon=None, item=None) -> None:
+        """Tray left-click / «Открыть»: restore window at saved position."""
+        hwnd = self._get_hwnd()
+        if not hwnd:
+            return
+        try:
+            import win32gui
+            import win32con
+        except Exception:
+            return
+        try:
+            win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+            if self._saved_rect is not None:
+                x, y, w, h = self._saved_rect
+                # SWP_NOZORDER keeps z-order; we manually raise via
+                # SetForegroundWindow below so we don't fight other
+                # foreground apps for focus on tray click.
+                win32gui.SetWindowPos(
+                    hwnd, 0, x, y, w, h,
+                    win32con.SWP_NOZORDER | win32con.SWP_SHOWWINDOW,
+                )
+            try:
+                win32gui.SetForegroundWindow(hwnd)
+            except Exception:
+                # Win32 sometimes refuses if foreground lock active.
+                # ShowWindow already made it visible; user can click to focus.
+                pass
+        except Exception:
+            pass
+
+    def _on_quit_clicked(self, icon=None, item=None) -> None:
+        try:
+            if self._icon is not None:
+                self._icon.stop()
+        except Exception:
+            pass
+        self._on_quit()
+
+
+def _draw_tray_icon_fallback():
+    """Pure-pillow fallback icon (used when .ico unavailable at runtime)."""
+    from PIL import Image, ImageDraw, ImageFilter
+    size = 64
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse([4, 4, size - 4, size - 4], fill=(11, 14, 21, 255))
+    cx = cy = size // 2
+    r = int(size * 0.28)
+    d.arc([cx - r, cy - r, cx + r, cy + r], start=307, end=593,
+          fill=(63, 185, 80, 255), width=4)
+    d.line([cx, cy - r - 2, cx, cy - r // 2],
+           fill=(94, 211, 116, 255), width=4)
+    return img
+
+
+def _find_window_hwnd(title: str) -> int:
+    """Cached HWND lookup by exact title match."""
+    try:
+        import win32gui
+        return win32gui.FindWindow(None, title)
+    except Exception:
+        try:
+            return ctypes.windll.user32.FindWindowW(None, title)
+        except Exception:
+            return 0
+
+
 # ─── pywebview API (exposed to JavaScript) ────────────────────────────────────
 
 class Api:
@@ -343,6 +501,7 @@ class Api:
 
     def __init__(self) -> None:
         self.window = None
+        self.tray: "_TrayManager | None" = None
         self.process: subprocess.Popen | None = None
         self.stderr_drain: _StderrDrain | None = None
 
@@ -492,6 +651,12 @@ class Api:
         return {"ok": True}
 
     def minimize(self) -> None:
+        # User clicked the titlebar minimize → hide to tray (preserves
+        # position/monitor for restore). Falls back to native minimize
+        # if tray failed to initialize.
+        if self.tray is not None and self.tray.is_running():
+            self.tray.hide_window_to_tray()
+            return
         if self.window is not None:
             try:
                 self.window.minimize()
@@ -503,6 +668,8 @@ class Api:
         # On app exit, ALWAYS stop the tunnel (regardless of tg_enabled flag).
         # The flag remains set so next launch auto-starts.
         self._tg_stop(persist=False)
+        if self.tray is not None:
+            self.tray.stop()
         if self.window is not None:
             try:
                 self.window.destroy()
@@ -883,8 +1050,32 @@ def main() -> None:
 
     api.attach(window)
 
+    # Tray setup — started AFTER window is shown so HWND lookups have something
+    # to find. Quit-from-tray must mirror window-close: stop workers, destroy
+    # the webview window, and let webview.start() return on the main thread.
+    def _quit_from_tray() -> None:
+        try:
+            api.stop()
+        except Exception:
+            pass
+        try:
+            api._tg_stop(persist=False)
+        except Exception:
+            pass
+        try:
+            window.destroy()
+        except Exception:
+            pass
+
+    tray = _TrayManager(
+        get_hwnd=lambda: _find_window_hwnd(window.title),
+        on_quit=_quit_from_tray,
+    )
+    api.tray = tray
+
     def on_shown() -> None:
         _apply_win11_chrome(window)
+        tray.start()
 
     try:
         window.events.shown += on_shown
