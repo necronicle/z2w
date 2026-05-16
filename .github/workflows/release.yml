@@ -114,13 +114,14 @@ jobs:
         shell: pwsh
         run: |
           # Catches fork-side regressions (missing options, syntax breaks
-          # in profiles) BEFORE we ship a broken release. We simulate
-          # _write_winws_config() here, append --dry-run inside the
-          # config (since @<config_file> must be the only CLI arg), and
-          # invoke winws2.exe @config. Exit 0 = options recognized +
-          # syntax parses. Anything else fails the build.
+          # in profiles, broken config_from_file()) BEFORE ship.
+          # We simulate _write_winws_config(), append --dry-run inside
+          # the config (since @<config_file> must be the only CLI arg),
+          # invoke winws2.exe @config in an isolated dir with minimal
+          # PATH so it actually exercises the production code path:
+          # no Git Bash, no Cygwin, no /bin/sh on PATH. This catches
+          # the wordexp-fork-fail case that broke on real user installs.
           $ErrorActionPreference = "Stop"
-          # Compose conf: BASE_ARGS lines + each non-comment profile line.
           $py = @'
           import re, shlex, sys
           base = []
@@ -134,7 +135,6 @@ jobs:
               if not line or line.startswith("#"):
                   continue
               args.extend(line.split())
-          # Append --dry-run so winws2 exits 0 after validating args.
           args.append("--dry-run")
           out = "\n".join(shlex.quote(a) for a in args) + "\n"
           open("cache/winws2.smoke.conf", "w", encoding="utf-8", newline="\n").write(out)
@@ -143,15 +143,39 @@ jobs:
           New-Item -ItemType Directory -Force cache | Out-Null
           $py | Out-File -Encoding utf8 -NoNewline _smoke_build.py
           python _smoke_build.py
-          Write-Host "Running winws2 --dry-run via @config..."
-          & .\winws2.exe "@cache/winws2.smoke.conf"
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::winws2 rejected the generated config (exit $LASTEXITCODE)."
-            Write-Host "Likely a fork regression: an option in BASE_ARGS or profiles is not recognized by winws2.exe."
+
+          # Stage a minimal bundle into a temp dir that mirrors the user
+          # installation layout: winws2.exe + cygwin1.dll + WinDivert*
+          # + lua/ + files/ + hostlists/ + windivert.filter/ + cache/conf.
+          # No bash.exe, no sh.exe — same as what the user actually gets
+          # from z2w.zip.
+          $stage = "$env:RUNNER_TEMP\winws2-smoke"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item winws2.exe, cygwin1.dll, WinDivert.dll, WinDivert64.sys $stage
+          Copy-Item -Recurse lua, files, hostlists, windivert.filter $stage -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force "$stage\cache" | Out-Null
+          Copy-Item cache\winws2.smoke.conf "$stage\cache\"
+
+          # Strip PATH to bare-minimum Windows dirs so cygwin1.dll's
+          # wordexp (if still used by upstream) can't find any external
+          # /bin/sh-like helper. Reproduces production: standalone bundle
+          # with nothing on PATH.
+          $env:PATH = "$env:SystemRoot\system32;$env:SystemRoot"
+          Write-Host "Running winws2 --dry-run via @config from minimal bundle..."
+          Push-Location $stage
+          try {
+            & .\winws2.exe "@cache/winws2.smoke.conf"
+            $rc = $LASTEXITCODE
+          } finally {
+            Pop-Location
+          }
+          if ($rc -ne 0) {
+            Write-Host "::error::winws2 rejected the generated config (exit $rc)."
+            Write-Host "Could be (a) a fork regression: an option in BASE_ARGS or profiles is not recognized, or (b) config_from_file() tokenizer broken for our config syntax."
             exit 1
           }
           Remove-Item -Force _smoke_build.py
-          Remove-Item -Force cache/winws2.smoke.conf
+          Remove-Item -Recurse -Force $stage
 
       - name: Build z2w.exe
         run: >
