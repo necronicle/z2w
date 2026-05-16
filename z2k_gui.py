@@ -552,12 +552,12 @@ class Api:
             )
             self.tg_watchdog_thread.start()
 
-    def _tg_stop(self, persist: bool = True) -> None:
-        """Kill tg-transparent + wind down. persist=True means user-stop
-        (tg_want_running cleared); persist=False is app-exit cleanup."""
+    def _tg_kill_proc(self) -> None:
+        """Silent kill of the current tg_proc + drain. NO UI emit, NO flag
+        changes. Idempotent — no-op if no proc. Used both by user-stop
+        (followed by 'stopped' emit) and by persistent-give-up paths
+        (followed by 'error' emit — must NOT be clobbered with 'stopped')."""
         with self._tg_lock:
-            if persist:
-                self.tg_want_running = False
             proc = self.tg_proc
             self.tg_proc = None
             self.tg_stderr_drain = None
@@ -571,6 +571,15 @@ class Api:
                 except Exception:
                     pass
         _kill_stale("tg-transparent.exe")
+
+    def _tg_stop(self, persist: bool = True) -> None:
+        """User-initiated stop. Kills proc + emits 'stopped'.
+        persist=True clears tg_want_running so watchdog exits;
+        persist=False is app-exit cleanup (flag preserved on disk)."""
+        if persist:
+            with self._tg_lock:
+                self.tg_want_running = False
+        self._tg_kill_proc()
         self._tg_emit("stopped")
 
     def _tg_crash_check(self) -> None:
@@ -589,9 +598,10 @@ class Api:
         if drain is not None:
             drain.join(timeout=0.5)
         tail = drain.tail(12) if drain else ""
+        # Process has already exited (poll != None above), but _tg_kill_proc
+        # also nulls tg_proc/drain refs and calls _kill_stale for safety.
+        self._tg_kill_proc()
         with self._tg_lock:
-            self.tg_proc = None
-            self.tg_stderr_drain = None
             # Don't loop-restart on immediate crash AND don't autostart next
             # session — UI now shows error+unchecked, backend must match.
             self._tg_give_up()
@@ -658,6 +668,13 @@ class Api:
         while self._tg_restart_log and now - self._tg_restart_log[0] > TG_RESTART_BUDGET_WIN:
             self._tg_restart_log.popleft()
         if len(self._tg_restart_log) >= TG_RESTART_BUDGET:
+            # CRITICAL: kill the broken proc BEFORE emitting error. stderr-storm
+            # and probe-fail branches reach here with a live tg-transparent.exe
+            # still holding its WinDivert handle — without this kill it leaks
+            # past give-up and continues intercepting TG traffic with no logic
+            # behind it. Silent kill (no 'stopped' emit) so the final 'error'
+            # state in UI isn't clobbered.
+            self._tg_kill_proc()
             with self._tg_lock:
                 # Same persistent give-up as immediate crash — backend state,
                 # disk flag, and UI checkbox must agree across z2w restarts.
