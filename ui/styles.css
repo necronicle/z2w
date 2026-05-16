@@ -109,7 +109,6 @@ body.is-on .bg-glow {
 /* ─── Titlebar ─────────────────────────────────────────────── */
 
 .titlebar {
-  -webkit-app-region: drag;
   height: 38px;
   display: flex;
   align-items: center;
@@ -119,6 +118,11 @@ body.is-on .bg-glow {
   position: relative;
   z-index: 5;
 }
+
+/* pywebview attaches mousedown→move_window to .pywebview-drag-region.
+   Interactive descendants (button, input, a, select) are auto-skipped
+   by pywebview's handler, so we don't need to mark them no-drag. */
+.pywebview-drag-region { cursor: default; }
 
 .brand {
   display: flex;
@@ -164,7 +168,6 @@ body:not(.is-on) .brand-mark {
 }
 
 .window-controls {
-  -webkit-app-region: no-drag;
   display: flex;
   gap: 0;
   height: 100%;

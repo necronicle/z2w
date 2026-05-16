@@ -414,7 +414,7 @@ def main() -> None:
             min_size=(380, 580),
             resizable=False,
             frameless=True,
-            easy_drag=False,  # custom drag region in CSS (-webkit-app-region)
+            easy_drag=False,  # only .pywebview-drag-region (titlebar) drags
             background_color="#0b0e15",
         )
     except Exception as exc:
