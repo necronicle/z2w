@@ -520,6 +520,11 @@ class Api:
             if self._tg_alive():
                 return  # already running
             if not TG_PROXY_EXE.exists():
+                # TOCTOU window: set_tg_enabled() checked exe and wrote the
+                # flag, then this thread was scheduled, and meanwhile the exe
+                # was quarantined/deleted. Clear persistent state under the
+                # same lock so the next z2w launch doesn't blindly autostart.
+                self._tg_give_up()
                 self._tg_emit("error", "tg-transparent.exe не найден")
                 return
 
