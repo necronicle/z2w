@@ -53,10 +53,10 @@ _INSTAGRAM_DNS = {
 
 BASE_ARGS = [
     "--wf-tcp-out=80,443,2053,2083,2087,2096,8443",
+    "--rst-filter=on",
     "--lua-init=@lua/zapret-lib.lua",
     "--lua-init=@lua/zapret-antidpi.lua",
     "--lua-init=@lua/zapret-auto.lua",
-    "--lua-init=@lua/locked.lua",
     "--lua-init=@lua/z2k-detectors.lua",
     "--lua-init=@lua/z2k-fooling-ext.lua",
     "--lua-init=@lua/z2k-range-rand.lua",

@@ -125,7 +125,7 @@ function http_domcase(ctx, desync)
 		local host_range = resolve_multi_pos(desync.dis.payload,desync.l7payload,"host,endhost")
 		if #host_range == 2 then
 			local host = string.sub(desync.dis.payload,host_range[1],host_range[2]-1)
-			local newhost="", i
+			local newhost=""
 			for i = 1, #host do
 				newhost=newhost..((i%2)==0 and string.lower(string.sub(host,i,i)) or string.upper(string.sub(host,i,i)))
 			end
@@ -221,7 +221,7 @@ function http_unixeol(ctx, desync)
 				if #http < #desync.dis.payload then
 					hdis.headers[idx_ua].value = hdis.headers[idx_ua].value .. string.rep(" ", #desync.dis.payload - #http)
 				end
-				local http = http_reconstruct_req(hdis, true)
+				http = http_reconstruct_req(hdis, true)
 				if #http==#desync.dis.payload then
 					desync.dis.payload = http
 					DLOG("http_unixeol: applied")
@@ -389,7 +389,8 @@ function syndata(ctx, desync)
 			dis.payload = blob(desync, desync.arg.blob, "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
 			apply_fooling(desync, dis)
 			if desync.arg.tls_mod then
-				dis.payload = tls_mod_shim(desync, dis.payload, desync.arg.tls_mod, nil)
+				local pl = tls_mod_shim(desync, dis.payload, desync.arg.tls_mod, nil)
+				if pl then dis.payload = pl end
 			end
 			if b_debug then DLOG("syndata: "..hexdump_dlog(dis.payload)) end
 			if rawsend_dissect_ipfrag(dis, desync_opts(desync)) then
@@ -448,12 +449,37 @@ function fake(ctx, desync)
 				return
 			end
 			local fake_payload = blob(desync, desync.arg.blob)
-			if desync.reasm_data and desync.arg.tls_mod then
-				fake_payload = tls_mod_shim(desync, fake_payload, desync.arg.tls_mod, desync.reasm_data)
+			-- Per-attempt TLSMod rotation (z2k v0.9.5.1-z2k-r1).
+			-- При repeats > 1 + tls_mod, ТСПУ запоминает fingerprint первого
+			-- fake-пакета и игнорит остальные repeats с тем же модификатором
+			-- (ntc.party 22516 #84). Раньше TLSMod() вызывался один раз перед
+			-- rawsend_rep — все N repeats были байт-идентичны. Чтобы получить
+			-- N разных fingerprint'ов: разворачиваем repeats в lua-loop, каждая
+			-- итерация перевызывает tls_mod_shim для fresh randomization
+			-- (rnd/rndsni/padencap pad randomized per call). dupsid читает
+			-- payload (immutable across iterations) → SessionID consistent.
+			-- Force repeats=1 inside loop чтобы C-rawsend_rep не множил
+			-- каждую итерацию ещё раз.
+			local repeats = tonumber(desync.arg.repeats) or 1
+			if repeats > 1 and desync.reasm_data and desync.arg.tls_mod then
+				local saved_repeats = desync.arg.repeats
+				desync.arg.repeats = 1
+				for _ = 1, repeats do
+					local pl = tls_mod_shim(desync, fake_payload, desync.arg.tls_mod, desync.reasm_data)
+					local payload_to_send = pl or fake_payload
+					if b_debug then DLOG("fake (per-attempt): "..hexdump_dlog(payload_to_send)) end
+					rawsend_payload_segmented(desync, payload_to_send)
+				end
+				desync.arg.repeats = saved_repeats
+			else
+				if desync.reasm_data and desync.arg.tls_mod then
+					local pl = tls_mod_shim(desync, fake_payload, desync.arg.tls_mod, desync.reasm_data)
+					if pl then fake_payload = pl end
+				end
+				-- check debug to save CPU
+				if b_debug then DLOG("fake: "..hexdump_dlog(fake_payload)) end
+				rawsend_payload_segmented(desync,fake_payload)
 			end
-			-- check debug to save CPU
-			if b_debug then DLOG("fake: "..hexdump_dlog(fake_payload)) end
-			rawsend_payload_segmented(desync,fake_payload)
 		else
 			DLOG("fake: not acting on further replay pieces")
 		end
@@ -729,13 +755,14 @@ function hostfakesplit(ctx, desync)
 				local midhost
 				if desync.arg.midhost then
 					midhost = resolve_pos(data,desync.l7payload,desync.arg.midhost)
-					if not midhost then
+					if midhost then
+						DLOG("hosfakesplit: midhost marker resolved to "..midhost)
+						if midhost<=pos[1] or midhost>pos[2] then
+							DLOG("hostfakesplit: midhost is not inside the host range")
+							midhost = nil
+						end
+					else
 						DLOG("hostfakesplit: cannot resolve midhost marker '"..desync.arg.midhost.."'")
-					end
-					DLOG("hosfakesplit: midhost marker resolved to "..midhost)
-					if midhost<=pos[1] or midhost>pos[2] then
-						DLOG("hostfakesplit: midhost is not inside the host range")
-						midhost = nil
 					end
 				end
 				-- if present apply ipfrag only to real host parts. fakes and parts outside of the host must be visible to DPI.
@@ -893,7 +920,7 @@ function fakedsplit(ctx, desync)
 					return desync.arg.nodrop and VERDICT_PASS or VERDICT_DROP
 				end
 			else
-				DLOG("fakedsplit: cannot resolve pos '"..desync.arg.pos.."'")
+				DLOG("fakedsplit: cannot resolve pos '"..spos.."'")
 			end
 		else
 			DLOG("fakedsplit: not acting on further replay pieces")
@@ -938,11 +965,11 @@ function fakeddisorder(ctx, desync)
 					if b_debug then DLOG("fakeddisorder: resolved split pos: "..tostring(pos-1)) end
 
 					-- do not apply fooling to original parts except tcp_ts_up but apply ip_id
-					local fake, part, pat
+					local fake, part
 					local opts_orig = {rawsend = rawsend_opts_base(desync), reconstruct = {}, ipfrag = {}, ipid = desync.arg, fooling = {tcp_ts_up = desync.arg.tcp_ts_up}}
 					local opts_fake = {rawsend = rawsend_opts(desync), reconstruct = reconstruct_opts(desync), ipfrag = {}, ipid = desync.arg, fooling = desync.arg}
 
-					fakepat = desync.arg.pattern and blob(desync,desync.arg.pattern) or "\x00"
+					local fakepat = desync.arg.pattern and blob(desync,desync.arg.pattern) or "\x00"
 
 					-- second fake
 					fake = pattern(fakepat,pos,#data-pos+1)
@@ -1008,7 +1035,7 @@ function fakeddisorder(ctx, desync)
 					return desync.arg.nodrop and VERDICT_PASS or VERDICT_DROP
 				end
 			else
-				DLOG("fakeddisorder: cannot resolve pos '"..desync.arg.pos.."'")
+				DLOG("fakeddisorder: cannot resolve pos '"..spos.."'")
 			end
 		else
 			DLOG("fakeddisorder: not acting on further replay pieces")
@@ -1209,8 +1236,8 @@ function udplen(ctx, desync)
 				else
 					desync.dis.payload = string.sub(desync.dis.payload,1,len+inc)
 					DLOG("udplen: "..len.." => "..#desync.dis.payload)
+					return VERDICT_MODIFY
 				end
-				return VERDICT_MODIFY
 			end
 		end
 	end
