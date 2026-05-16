@@ -21,6 +21,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # For tag push: github.ref already points at the tag → no-op.
+          # For workflow_dispatch: pin checkout to the requested tag so we
+          # don't package branch HEAD under that tag.
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - name: Setup Python
         uses: actions/setup-python@v5

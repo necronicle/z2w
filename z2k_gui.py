@@ -32,7 +32,9 @@ PROFILES         = SCRIPT_DIR / "profiles.default.txt"
 RKN_SILENT_FLAG  = SCRIPT_DIR / "cache" / "autocircular" / "rkn_silent_fallback.flag"
 TG_PROXY_EXE     = SCRIPT_DIR / "tg-transparent.exe"
 UI_INDEX         = RES_DIR / "ui" / "index.html"
-WINWS_LOG_FILE   = SCRIPT_DIR / "z2w-winws.log"  # rolling log, truncated each start
+WINWS_LOG_FILE   = SCRIPT_DIR / "z2w-winws.log"      # current session log
+WINWS_LOG_OLD    = SCRIPT_DIR / "z2w-winws.log.1"    # previous rotation
+WINWS_LOG_CAP    = 2 * 1024 * 1024                   # 2 MB per file
 
 # How many trailing stderr lines to keep in RAM for crash-report popup.
 STDERR_TAIL_LINES = 80
@@ -175,25 +177,58 @@ class _StderrDrain(threading.Thread):
     "stop responding".
 
     Each instance:
-      • Mirrors raw stderr bytes into a rolling log file on disk
-        (truncated on every start) — useful for support reports.
+      • Mirrors raw stderr bytes into a size-capped rotating log file
+        (current → .1 → discard). Capped at WINWS_LOG_CAP per file, so
+        long-running sessions stay bounded at ~2×CAP on disk total.
       • Keeps the last STDERR_TAIL_LINES decoded lines in memory so
         the crash callback can show recent context to the user.
     """
 
-    def __init__(self, stream, log_path: Path | None) -> None:
+    def __init__(self, stream, log_path: Path | None,
+                 log_path_old: Path | None = None,
+                 size_cap: int = WINWS_LOG_CAP) -> None:
         super().__init__(daemon=True, name="winws2-stderr-drain")
         self.stream = stream
         self.log_path = log_path
+        self.log_path_old = log_path_old
+        self.size_cap = size_cap
         self.lines: collections.deque[str] = collections.deque(maxlen=STDERR_TAIL_LINES)
 
-    def run(self) -> None:
-        log_fh = None
-        if self.log_path is not None:
+    def _open_log(self):
+        if self.log_path is None:
+            return None
+        try:
+            return self.log_path.open("wb")
+        except OSError:
+            return None
+
+    def _rotate(self, log_fh):
+        """Close current, move → .1 (overwriting), reopen fresh."""
+        try:
+            log_fh.close()
+        except Exception:
+            pass
+        if self.log_path is None:
+            return None
+        if self.log_path_old is not None:
             try:
-                log_fh = self.log_path.open("wb")
+                if self.log_path_old.exists():
+                    self.log_path_old.unlink()
             except OSError:
-                log_fh = None
+                pass
+            try:
+                self.log_path.replace(self.log_path_old)
+            except OSError:
+                # If rename failed, fall back to truncating in place.
+                try:
+                    self.log_path.unlink()
+                except OSError:
+                    pass
+        return self._open_log()
+
+    def run(self) -> None:
+        log_fh = self._open_log()
+        bytes_written = 0
         try:
             for raw in iter(self.stream.readline, b""):
                 if not raw:
@@ -202,6 +237,10 @@ class _StderrDrain(threading.Thread):
                     try:
                         log_fh.write(raw)
                         log_fh.flush()
+                        bytes_written += len(raw)
+                        if bytes_written >= self.size_cap:
+                            log_fh = self._rotate(log_fh)
+                            bytes_written = 0
                     except Exception:
                         try:
                             log_fh.close()
@@ -288,7 +327,9 @@ class Api:
 
         # CRITICAL: drain stderr continuously so the OS pipe buffer never fills.
         # See _StderrDrain docstring for the failure mode this prevents.
-        self.stderr_drain = _StderrDrain(self.process.stderr, WINWS_LOG_FILE)
+        self.stderr_drain = _StderrDrain(
+            self.process.stderr, WINWS_LOG_FILE, WINWS_LOG_OLD,
+        )
         self.stderr_drain.start()
 
         if self.tg_enabled:
