@@ -28,27 +28,56 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install pyinstaller pillow
+        run: pip install pyinstaller pillow pywebview pywin32
 
       - name: Generate icon
         shell: python
         run: |
-          from PIL import Image, ImageDraw
+          from PIL import Image, ImageDraw, ImageFilter
+
+          # Palette matches in-app styles.css.
+          BG_DARK  = (11, 14, 21, 255)
+          BG_INNER = (19, 24, 38, 255)
+          ACCENT   = (63, 185, 80, 255)
+          ACCENT_F = (94, 211, 116, 255)
 
           def make_icon(size):
               img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
               d = ImageDraw.Draw(img)
               cx = cy = size // 2
-              pad = size // 7
-              d.ellipse([pad, pad, size-pad, size-pad], fill=(13, 13, 32, 255))
-              d.ellipse([pad-2, pad-2, size-pad+2, size-pad+2],
-                        outline=(25, 25, 55, 160), width=max(1, size // 48))
-              r = int(size * 0.27)
+              pad = max(1, size // 12)
+
+              # Outer disc — near-black, rounded.
+              d.ellipse([pad, pad, size-pad, size-pad], fill=BG_DARK)
+              ring_w = max(1, size // 40)
+              d.ellipse([pad, pad, size-pad, size-pad],
+                        outline=(40, 48, 74, 200), width=ring_w)
+
+              # Soft inner highlight (top).
+              hi = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+              hd = ImageDraw.Draw(hi)
+              hd.ellipse([pad+ring_w, pad+ring_w,
+                          size-pad-ring_w, size-pad-ring_w], fill=BG_INNER)
+              img = Image.alpha_composite(img, hi)
+              d = ImageDraw.Draw(img)
+
+              # Power symbol — arc + vertical line, accent green.
+              r = int(size * 0.26)
               box = [cx-r, cy-r, cx+r, cy+r]
-              lw = max(1, size // 18)
-              d.arc(box, start=307, end=593, fill=(50, 50, 95, 255), width=lw)
-              d.line([cx, cy - r - lw, cx, cy - r // 2],
-                     fill=(50, 50, 95, 255), width=lw)
+              lw = max(2, size // 14)
+              d.arc(box, start=307, end=593, fill=ACCENT, width=lw)
+              d.line([cx, cy - r - lw // 2, cx, cy - r // 2],
+                     fill=ACCENT_F, width=lw)
+
+              # Subtle glow (apply for >= 48px).
+              if size >= 48:
+                  glow = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+                  gd = ImageDraw.Draw(glow)
+                  gd.arc(box, start=307, end=593,
+                         fill=(63, 185, 80, 80), width=lw + 2)
+                  glow = glow.filter(ImageFilter.GaussianBlur(max(1, size // 28)))
+                  img = Image.alpha_composite(img, glow)
+
               return img
 
           sizes = [16, 24, 32, 48, 64, 128, 256]
@@ -64,6 +93,10 @@ jobs:
           --uac-admin
           --name z2w
           --icon z2w.ico
+          --add-data "ui;ui"
+          --collect-data webview
+          --collect-submodules webview
+          --hidden-import clr_loader.types
           z2k_gui.py
 
       - name: Package release
@@ -72,7 +105,7 @@ jobs:
           $out = New-Item -ItemType Directory "z2w-release" -Force
           $skip = @('z2k_gui.py', 'z2w.ico', 'z2w.spec', 'build', 'dist',
                     '__pycache__', '.github', '.gitignore', 'README.md',
-                    'z2w-release', 'z2w.zip')
+                    'z2w-release', 'z2w.zip', 'ui')
 
           Get-ChildItem . |
             Where-Object { $_.Name -notin $skip } |

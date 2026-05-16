@@ -1,36 +1,45 @@
 #!/usr/bin/env python3
 """
-z2w GUI — кнопка включения/выключения DPI-обхода.
-Запускает winws2.exe с аргументами из profiles.default.txt.
-Требует прав администратора (запрашивает UAC автоматически).
+z2w — Windows DPI-bypass launcher.
+
+Architecture:
+    * UI: HTML/CSS/JS, rendered in a pywebview window (WebView2 on Win10/11).
+    * Backend: this file. Exposes an `Api` class to JavaScript via pywebview.
+    * Worker: winws2.exe spawned with args from BASE_ARGS + profiles.default.txt.
 """
 
-import os
-import sys
-import math
-import ctypes
-import threading
-import subprocess
-import tkinter as tk
-import tkinter.messagebox as msgbox
+from __future__ import annotations
 
-# ─── Пути ────────────────────────────────────────────────────────────────────
+import ctypes
+import os
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+# ─── Paths ────────────────────────────────────────────────────────────────────
 
 if getattr(sys, "frozen", False):
-    SCRIPT_DIR = os.path.dirname(sys.executable)
+    SCRIPT_DIR = Path(sys.executable).resolve().parent
+    RES_DIR    = Path(getattr(sys, "_MEIPASS", str(SCRIPT_DIR)))
 else:
-    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    SCRIPT_DIR = Path(__file__).resolve().parent
+    RES_DIR    = SCRIPT_DIR
 
-WINWS_EXE       = os.path.join(SCRIPT_DIR, "winws2.exe")
-PROFILES        = os.path.join(SCRIPT_DIR, "profiles.default.txt")
-RKN_SILENT_FLAG = os.path.join(SCRIPT_DIR, "cache", "autocircular", "rkn_silent_fallback.flag")
-TG_PROXY_EXE   = os.path.join(SCRIPT_DIR, "tg-transparent.exe")
+WINWS_EXE        = SCRIPT_DIR / "winws2.exe"
+PROFILES         = SCRIPT_DIR / "profiles.default.txt"
+RKN_SILENT_FLAG  = SCRIPT_DIR / "cache" / "autocircular" / "rkn_silent_fallback.flag"
+TG_PROXY_EXE     = SCRIPT_DIR / "tg-transparent.exe"
+UI_INDEX         = RES_DIR / "ui" / "index.html"
 
-_UNBLOCK_NAMES = ["winws2.exe", "cygwin1.dll", "WinDivert.dll", "WinDivert64.sys",
-                   "tg-transparent.exe"]
+VERSION = "1.4.1"
 
-HOSTS_FILE = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
-                          "System32", "drivers", "etc", "hosts")
+_UNBLOCK_NAMES = [
+    "winws2.exe", "cygwin1.dll", "WinDivert.dll", "WinDivert64.sys",
+    "tg-transparent.exe",
+]
+
+HOSTS_FILE = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "drivers" / "etc" / "hosts"
 
 _INSTAGRAM_DNS = {
     "instagram.com":                "157.240.251.174",
@@ -84,9 +93,9 @@ BASE_ARGS = [
     "--wf-raw-part=@windivert.filter/windivert_part.quic_initial_ietf.txt",
 ]
 
-VERSION = "1.4.1"
+CREATE_NO_WINDOW = 0x08000000
 
-# ─── UAC ─────────────────────────────────────────────────────────────────────
+# ─── UAC ──────────────────────────────────────────────────────────────────────
 
 def is_admin() -> bool:
     try:
@@ -94,268 +103,193 @@ def is_admin() -> bool:
     except Exception:
         return False
 
-def elevate_and_exit():
+def elevate_and_exit() -> None:
     params = " ".join(f'"{a}"' for a in sys.argv)
     rc = ctypes.windll.shell32.ShellExecuteW(
-        None, "runas", sys.executable, params, SCRIPT_DIR, 1
+        None, "runas", sys.executable, params, str(SCRIPT_DIR), 1,
     )
     sys.exit(0 if rc > 32 else 1)
 
-# ─── Дизайн-система ─────────────────────────────────────────────────────────
+# ─── Worker helpers ───────────────────────────────────────────────────────────
 
-class C:
-    """Палитра цветов."""
-    BG          = "#0a0a12"
-    SURFACE     = "#10101e"
-    SURFACE2    = "#16162a"
-    BORDER      = "#1a1a32"
-    BORDER_LT   = "#222244"
-    MUTED       = "#2e2e50"
-    TEXT_DIM    = "#4a4a78"
-    TEXT        = "#7a7aaa"
-    TEXT_BR     = "#9a9acc"
-    ACCENT      = "#22ee88"
-    ACCENT_DIM  = "#14bb5a"
-    ACCENT_DARK = "#0a5530"
-    RED         = "#ee4444"
-    RING_FILL   = "#0e0e1c"
-    BTN_OFF     = "#12122a"
-    BTN_ON      = "#071a10"
-    INSET_OFF   = "#0b0b1a"
-    INSET_ON    = "#041210"
-    ICON_OFF    = "#2a2a50"
-    GLOW_ON     = "#12aa50"
-    # Toggle switch
-    TRK_OFF     = "#1c1c36"
-    TRK_ON      = "#115533"
-    THB_OFF     = "#3a3a60"
-    THB_ON      = "#22ee88"
+def _kill_tree(pid: int) -> None:
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            capture_output=True, creationflags=CREATE_NO_WINDOW,
+        )
+    except Exception:
+        pass
 
-FONT      = "Segoe UI"
-FONT_MONO = "Consolas"
+def _kill_stale(image: str) -> None:
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/IM", image],
+            capture_output=True, creationflags=CREATE_NO_WINDOW,
+        )
+    except Exception:
+        pass
 
-def lerp(c1: str, c2: str, t: float) -> str:
-    r1, g1, b1 = int(c1[1:3], 16), int(c1[3:5], 16), int(c1[5:7], 16)
-    r2, g2, b2 = int(c2[1:3], 16), int(c2[3:5], 16), int(c2[5:7], 16)
-    clamp = lambda v: max(0, min(255, int(v)))
-    return f"#{clamp(r1+(r2-r1)*t):02x}{clamp(g1+(g2-g1)*t):02x}{clamp(b1+(b2-b1)*t):02x}"
+def _build_args() -> list[str]:
+    args = list(BASE_ARGS)
+    with open(PROFILES, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                args.extend(line.split())
+    return args
 
-# ─── Toggle Switch (Canvas) ─────────────────────────────────────────────────
+def _ensure_instagram_dns() -> None:
+    try:
+        content = HOSTS_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return
+    lower = content.lower()
+    missing = [f"{ip}  {d}" for d, ip in _INSTAGRAM_DNS.items() if d.lower() not in lower]
+    if not missing:
+        return
+    try:
+        with HOSTS_FILE.open("a", encoding="utf-8") as fh:
+            fh.write("\n# z2w — Instagram DNS fix\n")
+            for line in missing:
+                fh.write(line + "\n")
+    except OSError:
+        pass
 
-class ToggleSwitch(tk.Canvas):
-    """iOS-style toggle switch."""
-    W, H, R = 38, 20, 8  # width, height, thumb radius
+def _unblock_files() -> None:
+    for name in _UNBLOCK_NAMES:
+        path = SCRIPT_DIR / name
+        if path.exists():
+            subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-Command",
+                 f"Unblock-File -LiteralPath '{path}' -ErrorAction SilentlyContinue"],
+                capture_output=True, creationflags=CREATE_NO_WINDOW,
+            )
 
-    def __init__(self, master, variable=None, command=None, enabled=True, **kw):
-        super().__init__(master, width=self.W, height=self.H,
-                         bg=C.BG, highlightthickness=0, **kw)
-        self._var = variable or tk.BooleanVar(value=False)
-        self._cmd = command
-        self._enabled = enabled
-        self._anim_t = 1.0 if self._var.get() else 0.0
-        self._draw()
-        if enabled:
-            self.bind("<Button-1>", self._on_click)
-            self.bind("<Enter>", lambda e: self.config(cursor="hand2"))
-            self.bind("<Leave>", lambda e: self.config(cursor=""))
+# ─── pywebview API (exposed to JavaScript) ────────────────────────────────────
 
-    def _draw(self):
-        self.delete("all")
-        t = self._anim_t
-        trk = lerp(C.TRK_OFF, C.TRK_ON, t)
-        thb = lerp(C.THB_OFF, C.THB_ON, t)
-        if not self._enabled:
-            trk = C.SURFACE
-            thb = C.MUTED
-        # Track (pill shape)
-        r = self.H // 2
-        self.create_oval(1, 1, self.H-1, self.H-1, fill=trk, outline=C.BORDER, width=1)
-        self.create_oval(self.W-self.H+1, 1, self.W-1, self.H-1, fill=trk, outline=C.BORDER, width=1)
-        self.create_rectangle(r, 1, self.W-r, self.H-1, fill=trk, outline="", width=0)
-        self.create_line(r, 1, self.W-r, 1, fill=C.BORDER)
-        self.create_line(r, self.H-1, self.W-r, self.H-1, fill=C.BORDER)
-        # Thumb
-        cx = r + t * (self.W - self.H)
-        cy = self.H / 2
-        self.create_oval(cx-self.R, cy-self.R, cx+self.R, cy+self.R,
-                         fill=thb, outline="")
+class Api:
+    """Bridge between the HTML/JS frontend and the Python worker."""
 
-    def _on_click(self, _e=None):
-        self._var.set(not self._var.get())
-        self._animate()
-        if self._cmd:
-            self._cmd()
+    def __init__(self) -> None:
+        self.window = None
+        self.process: subprocess.Popen | None = None
+        self.tg_proxy_proc: subprocess.Popen | None = None
+        self.tg_enabled = False
 
-    def _animate(self, step=0):
-        target = 1.0 if self._var.get() else 0.0
-        self._anim_t += (target - self._anim_t) * 0.35
-        if abs(self._anim_t - target) < 0.02:
-            self._anim_t = target
-            self._draw()
-            return
-        self._draw()
-        self.after(16, self._animate)
+    # called from main()
+    def attach(self, window) -> None:
+        self.window = window
 
-# ─── Приложение ──────────────────────────────────────────────────────────────
+    @property
+    def running(self) -> bool:
+        return self.process is not None and self.process.poll() is None
 
-WIN_W, WIN_H = 320, 460
-BTN_S = 210  # canvas size for power button
-CX = CY = BTN_S // 2
+    # ── Public methods (called from JS) ──────────────────────
 
-class App:
-    def __init__(self):
-        self.running = False
-        self.process = None
-        self.tg_proxy_proc = None
-        self._phase = 0.0
+    def initial_state(self) -> dict:
+        RKN_SILENT_FLAG.parent.mkdir(parents=True, exist_ok=True)
+        return {
+            "version":      VERSION,
+            "running":      self.running,
+            "tg_available": TG_PROXY_EXE.exists(),
+            "rkn_silent":   RKN_SILENT_FLAG.exists(),
+        }
 
-        root = tk.Tk()
-        self.root = root
-        root.title("z2w")
-        root.geometry(f"{WIN_W}x{WIN_H}")
-        root.configure(bg=C.BG)
-        root.resizable(False, False)
-        root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self._center()
-        self._build_ui()
-        root.after(40, self._tick)
+    def start(self) -> dict:
+        try:
+            (SCRIPT_DIR / "cache" / "autocircular").mkdir(parents=True, exist_ok=True)
+            _kill_stale("winws2.exe")
+            _ensure_instagram_dns()
+            _unblock_files()
+            args = _build_args()
+            self.process = subprocess.Popen(
+                [str(WINWS_EXE), *args],
+                cwd=str(SCRIPT_DIR),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                creationflags=CREATE_NO_WINDOW,
+            )
+        except FileNotFoundError as exc:
+            return {"ok": False, "err": f"File not found: {Path(str(exc)).name}"}
+        except Exception as exc:
+            return {"ok": False, "err": str(exc)}
 
-    def _center(self):
-        self.root.update_idletasks()
-        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        self.root.geometry(f"+{(sw-WIN_W)//2}+{(sh-WIN_H)//2}")
+        if self.tg_enabled:
+            self._start_tg_proxy()
+        threading.Thread(target=self._watch, daemon=True).start()
+        return {"ok": True}
 
-    # ── UI ────────────────────────────────────────────────────────────────────
+    def stop(self) -> dict:
+        proc = self.process
+        if proc is not None:
+            self.process = None  # mark stopped before kill so _watch ignores exit
+            _kill_tree(proc.pid)
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        _kill_stale("winws2.exe")
+        self._stop_tg_proxy()
+        return {"ok": True}
 
-    def _build_ui(self):
-        r = self.root
-
-        # Header
-        hdr = tk.Frame(r, bg=C.BG)
-        hdr.pack(fill="x", pady=(24, 0))
-        tk.Label(hdr, text="z2w", bg=C.BG, fg=C.TEXT_BR,
-                 font=(FONT, 16, "bold")).pack()
-        tk.Label(hdr, text="DPI bypass", bg=C.BG, fg=C.MUTED,
-                 font=(FONT, 9)).pack(pady=(1, 0))
-
-        # Power button canvas
-        cv = tk.Canvas(r, width=BTN_S, height=BTN_S, bg=C.BG, highlightthickness=0)
-        cv.pack(pady=(12, 0))
-        self.cv = cv
-
-        # Glow rings
-        self.g3 = cv.create_oval(CX-102, CY-102, CX+102, CY+102,
-                                  outline=C.SURFACE, width=1, fill="")
-        self.g2 = cv.create_oval(CX-97, CY-97, CX+97, CY+97,
-                                  outline=C.SURFACE, width=1, fill="")
-        self.g1 = cv.create_oval(CX-91, CY-91, CX+91, CY+91,
-                                  outline=C.BORDER, width=2, fill=C.RING_FILL)
-        # Highlight arc
-        cv.create_arc(CX-90, CY-90, CX+90, CY+90, start=110, extent=90,
-                      outline="#1c1c38", width=1, style="arc")
-        # Button body
-        self.btn = cv.create_oval(CX-78, CY-78, CX+78, CY+78,
-                                   outline=C.BORDER, width=1,
-                                   fill=C.BTN_OFF, tags="btn")
-        # Inset
-        self.inset = cv.create_oval(CX-60, CY-60, CX+60, CY+60,
-                                     outline="#08080f", width=2,
-                                     fill=C.INSET_OFF, tags="btn")
-        cv.create_arc(CX-59, CY-59, CX+59, CY+59, start=110, extent=100,
-                      outline="#161630", width=1, style="arc", tags="btn")
-        # Power icon
-        R = 32
-        self.pw_arc = cv.create_arc(CX-R, CY-R, CX+R, CY+R,
-                                     start=54, extent=252,
-                                     outline=C.ICON_OFF, width=3,
-                                     style="arc", tags="btn")
-        self.pw_line = cv.create_line(CX, CY-R-4, CX, CY-14,
-                                       fill=C.ICON_OFF, width=3,
-                                       capstyle="round", tags="btn")
-        cv.bind("<Button-1>", self._toggle)
-        cv.tag_bind("btn", "<Enter>", lambda e: cv.config(cursor="hand2"))
-        cv.tag_bind("btn", "<Leave>", lambda e: cv.config(cursor=""))
-
-        # Status
-        self._status_var = tk.StringVar(value="DISCONNECTED")
-        self._status_lbl = tk.Label(r, textvariable=self._status_var,
-                                     bg=C.BG, fg=C.MUTED,
-                                     font=(FONT, 10, "bold"))
-        self._status_lbl.pack(pady=(6, 0))
-
-        # Divider
-        div = tk.Canvas(r, width=WIN_W-60, height=20, bg=C.BG, highlightthickness=0)
-        div.pack(pady=(10, 0))
-        div.create_line(0, 10, 80, 10, fill=C.BORDER)
-        div.create_text(130, 10, text="OPTIONS", fill=C.MUTED,
-                        font=(FONT, 7, "bold"), anchor="center")
-        div.create_line(180, 10, 260, 10, fill=C.BORDER)
-
-        # Settings rows
-        settings = tk.Frame(r, bg=C.BG)
-        settings.pack(fill="x", padx=36, pady=(6, 0))
-
-        # Row: Telegram proxy
-        tg_exists = os.path.isfile(TG_PROXY_EXE)
-        self._tg_var = tk.BooleanVar(value=False)
-        self._make_row(settings, "Telegram", self._tg_var, enabled=tg_exists)
-
-        # Row: RKN silent fallback
-        self._rkn_var = tk.BooleanVar(value=os.path.isfile(RKN_SILENT_FLAG))
-        self._make_row(settings, "RKN silent fallback", self._rkn_var,
-                       command=self._toggle_rkn_silent)
-
-        # Error
-        self._err_var = tk.StringVar()
-        tk.Label(r, textvariable=self._err_var, bg=C.BG, fg=C.RED,
-                 font=(FONT, 8), wraplength=270).pack(pady=(8, 0))
-
-        # Footer
-        tk.Label(r, text=f"v{VERSION}", bg=C.BG, fg=C.BORDER_LT,
-                 font=(FONT_MONO, 7)).pack(side="bottom", pady=(0, 10))
-
-    def _make_row(self, parent, label, variable, command=None, enabled=True):
-        row = tk.Frame(parent, bg=C.BG)
-        row.pack(fill="x", pady=4)
-        fg = C.TEXT if enabled else C.MUTED
-        tk.Label(row, text=label, bg=C.BG, fg=fg,
-                 font=(FONT, 9), anchor="w").pack(side="left")
-        sw = ToggleSwitch(row, variable=variable, command=command, enabled=enabled)
-        sw.pack(side="right")
-
-    # ── Logic ────────────────────────────────────────────────────────────────
-
-    def _toggle(self, _event=None):
+    def set_tg_enabled(self, enabled: bool) -> dict:
+        self.tg_enabled = bool(enabled)
         if self.running:
-            self._stop()
-        else:
-            self._start()
+            if self.tg_enabled and not self.tg_proxy_proc:
+                self._start_tg_proxy()
+            elif not self.tg_enabled and self.tg_proxy_proc:
+                self._stop_tg_proxy()
+        return {"ok": True}
 
-    def _toggle_rkn_silent(self):
-        os.makedirs(os.path.dirname(RKN_SILENT_FLAG), exist_ok=True)
-        if self._rkn_var.get():
-            with open(RKN_SILENT_FLAG, "w") as f:
-                f.write("1")
+    def set_rkn_silent(self, enabled: bool) -> dict:
+        RKN_SILENT_FLAG.parent.mkdir(parents=True, exist_ok=True)
+        if enabled:
+            RKN_SILENT_FLAG.write_text("1", encoding="utf-8")
         else:
             try:
-                os.remove(RKN_SILENT_FLAG)
+                RKN_SILENT_FLAG.unlink()
             except FileNotFoundError:
                 pass
+        return {"ok": True}
 
-    def _start_tg_proxy(self):
-        if not os.path.isfile(TG_PROXY_EXE):
+    def minimize(self) -> None:
+        if self.window is not None:
+            try:
+                self.window.minimize()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        self.stop()
+        if self.window is not None:
+            try:
+                self.window.destroy()
+            except Exception:
+                pass
+
+    # ── internals ────────────────────────────────────────────
+
+    def _start_tg_proxy(self) -> None:
+        if not TG_PROXY_EXE.exists():
             return
         try:
             self.tg_proxy_proc = subprocess.Popen(
-                [TG_PROXY_EXE], cwd=SCRIPT_DIR,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NO_WINDOW,
+                [str(TG_PROXY_EXE)],
+                cwd=str(SCRIPT_DIR),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=CREATE_NO_WINDOW,
             )
         except Exception:
             pass
 
-    def _stop_tg_proxy(self):
-        if self.tg_proxy_proc:
+    def _stop_tg_proxy(self) -> None:
+        if self.tg_proxy_proc is not None:
             try:
                 self.tg_proxy_proc.terminate()
                 self.tg_proxy_proc.wait(timeout=3)
@@ -365,176 +299,154 @@ class App:
                 except Exception:
                     pass
             self.tg_proxy_proc = None
-        try:
-            subprocess.run(["taskkill", "/F", "/IM", "tg-transparent.exe"],
-                           capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-        except Exception:
-            pass
+        _kill_stale("tg-transparent.exe")
 
-    @staticmethod
-    def _ensure_instagram_dns():
-        try:
-            with open(HOSTS_FILE, "r", encoding="utf-8") as f:
-                content = f.read()
-        except OSError:
-            return
-        lower = content.lower()
-        missing = [f"{ip}  {d}" for d, ip in _INSTAGRAM_DNS.items()
-                   if d.lower() not in lower]
-        if not missing:
-            return
-        try:
-            with open(HOSTS_FILE, "a", encoding="utf-8") as f:
-                f.write("\n# z2w — Instagram DNS fix\n")
-                for line in missing:
-                    f.write(line + "\n")
-        except OSError:
-            pass
-
-    def _unblock_files(self):
-        for name in _UNBLOCK_NAMES:
-            path = os.path.join(SCRIPT_DIR, name)
-            if os.path.exists(path):
-                subprocess.run(
-                    ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                     "-Command",
-                     f"Unblock-File -LiteralPath '{path}' -ErrorAction SilentlyContinue"],
-                    capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-
-    def _build_args(self) -> list:
-        args = list(BASE_ARGS)
-        with open(PROFILES, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    args.extend(line.split())
-        return args
-
-    def _start(self):
-        self._err_var.set("")
-        try:
-            os.makedirs(os.path.join(SCRIPT_DIR, "cache", "autocircular"), exist_ok=True)
-            self._kill_stale_winws()
-            self._ensure_instagram_dns()
-            self._unblock_files()
-            args = self._build_args()
-            self.process = subprocess.Popen(
-                [WINWS_EXE] + args, cwd=SCRIPT_DIR,
-                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-        except FileNotFoundError as e:
-            self._err_var.set(f"File not found: {os.path.basename(str(e))}")
-            return
-        except Exception as e:
-            self._err_var.set(str(e))
-            return
-
-        self.running = True
-        self._phase = 0.0
-        if self._tg_var.get():
-            self._start_tg_proxy()
-        self._refresh_visuals()
-        threading.Thread(target=self._watch_process, daemon=True).start()
-
-    @staticmethod
-    def _kill_tree(pid: int):
-        try:
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                           capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-        except Exception:
-            pass
-
-    @staticmethod
-    def _kill_stale_winws():
-        try:
-            subprocess.run(["taskkill", "/F", "/IM", "winws2.exe"],
-                           capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
-        except Exception:
-            pass
-
-    def _stop(self):
-        if self.process:
-            self._kill_tree(self.process.pid)
-            try:
-                self.process.wait(timeout=5)
-            except Exception:
-                try:
-                    self.process.kill()
-                except Exception:
-                    pass
-            self.process = None
-        self._kill_stale_winws()
-        self._stop_tg_proxy()
-        self.running = False
-        self._refresh_visuals()
-
-    def _watch_process(self):
+    def _watch(self) -> None:
+        """Wait for winws2 to exit; if it crashed, push a JS notification."""
         proc = self.process
-        if proc:
+        if proc is None:
+            return
+        try:
             proc.wait()
-            stderr_data = b""
+        except Exception:
+            return
+        if self.process is not proc:
+            return  # superseded by stop()
+        msg = ""
+        try:
+            data = proc.stderr.read() if proc.stderr else b""
+            if data:
+                msg = data.decode("utf-8", errors="replace").strip()[-300:]
+        except Exception:
+            pass
+        self.process = None
+        if self.window is not None:
             try:
-                stderr_data = proc.stderr.read()
+                self.window.evaluate_js(f"window.onWinwsCrash({_js_string(msg)})")
             except Exception:
                 pass
-            if self.running:
-                self.running = False
-                self.process = None
-                msg = stderr_data.decode("utf-8", errors="replace").strip()[-300:] if stderr_data else ""
-                self.root.after(0, lambda m=msg: self._on_crash(m))
 
-    def _on_crash(self, msg: str):
-        self._refresh_visuals()
-        self._err_var.set(f"winws2 crashed: {msg}" if msg else "winws2 stopped unexpectedly")
 
-    # ── Visuals ──────────────────────────────────────────────────────────────
+def _js_string(s: str) -> str:
+    if not s:
+        return "''"
+    return ("'" + s.replace("\\", "\\\\").replace("'", "\\'")
+                  .replace("\n", "\\n").replace("\r", "") + "'")
 
-    def _refresh_visuals(self, glow_t: float = 0.0):
-        cv = self.cv
-        on = self.running
-        cv.itemconfig(self.btn,     fill=C.BTN_ON   if on else C.BTN_OFF)
-        cv.itemconfig(self.inset,   fill=C.INSET_ON if on else C.INSET_OFF)
-        cv.itemconfig(self.pw_arc,  outline=C.ACCENT if on else C.ICON_OFF)
-        cv.itemconfig(self.pw_line, fill=C.ACCENT    if on else C.ICON_OFF)
-        if on:
-            cv.itemconfig(self.g1, outline=lerp(C.BORDER, C.GLOW_ON, glow_t * 0.7))
-            cv.itemconfig(self.g2, outline=lerp(C.SURFACE, C.GLOW_ON, glow_t * 0.4))
-            cv.itemconfig(self.g3, outline=lerp(C.SURFACE, C.GLOW_ON, glow_t * 0.2))
-        else:
-            cv.itemconfig(self.g1, outline=C.BORDER)
-            cv.itemconfig(self.g2, outline=C.SURFACE)
-            cv.itemconfig(self.g3, outline=C.SURFACE)
-        self._status_var.set("CONNECTED" if on else "DISCONNECTED")
-        self._status_lbl.config(fg=C.ACCENT if on else C.MUTED)
+# ─── Win11 chrome polish (Mica + dark titlebar + rounded corners) ─────────────
 
-    def _tick(self):
-        if self.running:
-            self._phase = (self._phase + 0.06) % (2 * math.pi)
-            t = (math.sin(self._phase) + 1) / 2
-            self._refresh_visuals(glow_t=0.3 + t * 0.7)
-        self.root.after(40, self._tick)
+def _apply_win11_chrome(window) -> None:
+    """Apply Mica + dark titlebar + rounded corners. Win10 fails silently."""
+    try:
+        import win32gui  # noqa: F401 (pywin32, bundled with pywebview)
+    except Exception:
+        win32gui = None
 
-    # ── Close ────────────────────────────────────────────────────────────────
+    hwnd = 0
+    try:
+        if win32gui is not None:
+            hwnd = win32gui.FindWindow(None, window.title)
+    except Exception:
+        hwnd = 0
+    if not hwnd:
+        try:
+            hwnd = ctypes.windll.user32.FindWindowW(None, window.title)
+        except Exception:
+            return
 
-    def _on_close(self):
-        self._stop()
-        self.root.destroy()
+    DWMWA_USE_IMMERSIVE_DARK_MODE   = 20
+    DWMWA_SYSTEMBACKDROP_TYPE       = 38   # Win11 22H2+: 2 = Mica, 4 = Mica Tabbed
+    DWMWA_WINDOW_CORNER_PREFERENCE  = 33   # Win11: 1 default, 2 round, 3 small
 
-    def mainloop(self):
-        self.root.mainloop()
+    dwm = ctypes.windll.dwmapi
+    int_one = ctypes.c_int(1)
+    int_two = ctypes.c_int(2)
 
-# ─── Entry point ─────────────────────────────────────────────────────────────
+    try:
+        dwm.DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
+                                  ctypes.byref(int_one), ctypes.sizeof(int_one))
+    except Exception:
+        pass
+    try:
+        dwm.DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE,
+                                  ctypes.byref(int_two), ctypes.sizeof(int_two))
+    except Exception:
+        pass
+    try:
+        dwm.DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
+                                  ctypes.byref(int_two), ctypes.sizeof(int_two))
+    except Exception:
+        pass
 
-def main():
+# ─── Entry ────────────────────────────────────────────────────────────────────
+
+def _show_fatal(msg: str) -> None:
+    try:
+        ctypes.windll.user32.MessageBoxW(None, msg, "z2w", 0x10)
+    except Exception:
+        print(msg, file=sys.stderr)
+
+def main() -> None:
     if not is_admin():
         elevate_and_exit()
-        root = tk.Tk()
-        root.withdraw()
-        msgbox.showerror("z2w", "z2w requires administrator privileges (WinDivert).\n"
-                                "Run the application as administrator.")
+        return
+
+    try:
+        import webview
+    except ImportError as exc:
+        _show_fatal(
+            "Не найден компонент pywebview.\n\n"
+            "Если ты собрал из исходников — выполни:\n"
+            "    pip install pywebview pywin32\n\n"
+            f"Подробности: {exc}"
+        )
         sys.exit(1)
-    App().mainloop()
+
+    api = Api()
+
+    try:
+        window = webview.create_window(
+            title="z2w",
+            url=str(UI_INDEX),
+            js_api=api,
+            width=400,
+            height=620,
+            min_size=(380, 580),
+            resizable=False,
+            frameless=True,
+            easy_drag=False,  # custom drag region in CSS (-webkit-app-region)
+            background_color="#0b0e15",
+        )
+    except Exception as exc:
+        _show_fatal(
+            "Не удалось создать окно.\n\n"
+            "Возможно, не установлен Microsoft Edge WebView2 Runtime.\n"
+            "Скачай его: https://go.microsoft.com/fwlink/p/?LinkId=2124703\n\n"
+            f"Подробности: {exc}"
+        )
+        sys.exit(1)
+
+    api.attach(window)
+
+    def on_shown() -> None:
+        _apply_win11_chrome(window)
+
+    try:
+        window.events.shown += on_shown
+    except Exception:
+        pass
+
+    try:
+        webview.start()
+    except Exception as exc:
+        _show_fatal(
+            "Не удалось запустить webview.\n\n"
+            "Проверь, что установлен Microsoft Edge WebView2 Runtime:\n"
+            "https://go.microsoft.com/fwlink/p/?LinkId=2124703\n\n"
+            f"Подробности: {exc}"
+        )
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

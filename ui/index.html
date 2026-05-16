@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+  <title>z2w</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body class="boot">
+  <div class="bg-grid" aria-hidden="true"></div>
+  <div class="bg-glow" aria-hidden="true"></div>
+
+  <header class="titlebar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 3v9"></path>
+          <path d="M6 7.5a8 8 0 1 0 12 0"></path>
+        </svg>
+      </span>
+      <span class="brand-name">z2w</span>
+      <span class="brand-dot" aria-hidden="true"></span>
+      <span class="brand-sub">DPI Bypass</span>
+    </div>
+    <div class="window-controls">
+      <button class="wc" id="wc-min" aria-label="Minimize">
+        <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 6h8"/></svg>
+      </button>
+      <button class="wc wc-close" id="wc-close" aria-label="Close">
+        <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main class="content">
+    <section class="hero">
+      <button id="power" class="power" aria-pressed="false" aria-label="Toggle DPI bypass">
+        <span class="ring r-outer" aria-hidden="true"></span>
+        <span class="ring r-mid" aria-hidden="true"></span>
+        <span class="ring r-inner" aria-hidden="true"></span>
+        <span class="core" aria-hidden="true">
+          <svg viewBox="0 0 36 36" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M18 5v13"></path>
+            <path d="M9.5 10a11 11 0 1 0 17 0"></path>
+          </svg>
+        </span>
+      </button>
+
+      <div class="status">
+        <div class="status-label" id="state">ОТКЛЮЧЕНО</div>
+        <div class="status-meta">
+          <span class="dot-status" id="state-dot"></span>
+          <span class="meta-text" id="status-sub">Нажмите чтобы включить обход</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="profiles" aria-label="Active profiles">
+      <div class="chip" data-profile="rkn">
+        <span class="chip-dot"></span>
+        <span class="chip-label">РКН</span>
+        <span class="chip-meta">48</span>
+      </div>
+      <div class="chip" data-profile="yt">
+        <span class="chip-dot"></span>
+        <span class="chip-label">YouTube</span>
+        <span class="chip-meta">22</span>
+      </div>
+      <div class="chip" data-profile="dc">
+        <span class="chip-dot"></span>
+        <span class="chip-label">Discord</span>
+        <span class="chip-meta">6</span>
+      </div>
+      <div class="chip" data-profile="http">
+        <span class="chip-dot"></span>
+        <span class="chip-label">HTTP</span>
+        <span class="chip-meta">40</span>
+      </div>
+    </section>
+
+    <section class="settings" aria-label="Settings">
+      <div class="section-title">Опции</div>
+
+      <div class="row" data-id="tg">
+        <div class="row-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21.5 4.5L2.5 12.4a.5.5 0 0 0 .04.94l4.36 1.4 2.07 5.97a.5.5 0 0 0 .87.12l2.66-3.04 4.6 3.4a.5.5 0 0 0 .79-.3l3.4-15.8a.5.5 0 0 0-.79-.59z"/>
+          </svg>
+        </div>
+        <div class="row-text">
+          <div class="row-title">Telegram</div>
+          <div class="row-sub" id="tg-sub">Прозрачный прокси</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="tg-toggle">
+          <span class="switch-track"><span class="switch-thumb"></span></span>
+        </label>
+      </div>
+
+      <div class="row" data-id="rkn">
+        <div class="row-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 3l8 4v5c0 5-3.5 8.5-8 9-4.5-.5-8-4-8-9V7l8-4z"/>
+            <path d="M9 12l2 2 4-4"/>
+          </svg>
+        </div>
+        <div class="row-text">
+          <div class="row-title">Silent fallback</div>
+          <div class="row-sub">Скрытый ротатор для РКН</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="rkn-toggle">
+          <span class="switch-track"><span class="switch-thumb"></span></span>
+        </label>
+      </div>
+    </section>
+
+    <div class="error" id="error" hidden></div>
+  </main>
+
+  <footer>
+    <span class="foot-item">
+      <span class="foot-mute">winws2</span>
+      <span class="foot-val">0.9.5.2</span>
+    </span>
+    <span class="foot-sep"></span>
+    <span class="foot-item">
+      <span class="foot-mute">v</span>
+      <span class="foot-val" id="ver">1.4.1</span>
+    </span>
+  </footer>
+
+  <script src="script.js"></script>
+</body>
+</html>
