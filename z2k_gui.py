@@ -403,6 +403,18 @@ class Api:
     def set_tg_enabled(self, enabled: bool) -> dict:
         """User toggled TG. Independent of winws2 power state."""
         want = bool(enabled)
+
+        # Validate BEFORE mutating persistent state. If we wrote the flag
+        # first and only then noticed the exe was missing, a later
+        # exe-restore (re-download, Defender quarantine release) would
+        # silently autostart TG on next z2w launch — user never asked for
+        # that. Leave self.tg_enabled / TG_ENABLED_FLAG untouched on this
+        # failure path so the user has to re-toggle explicitly once the
+        # exe is back.
+        if want and not TG_PROXY_EXE.exists():
+            self._tg_emit("error", "tg-transparent.exe не найден рядом с z2w.exe")
+            return {"ok": False, "err": "tg-transparent.exe не найден"}
+
         self.tg_enabled = want
         # Persist across z2w restarts (mirrors TG_PROXY_USER_DISABLED).
         try:
@@ -418,9 +430,6 @@ class Api:
             pass
 
         if want:
-            if not TG_PROXY_EXE.exists():
-                self._tg_emit("error", "tg-transparent.exe не найден рядом с z2w.exe")
-                return {"ok": False, "err": "tg-transparent.exe не найден"}
             # Spawn in background — UI doesn't wait for crash-grace.
             threading.Thread(target=self._tg_start, daemon=True,
                              name="tg-start").start()
