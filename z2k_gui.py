@@ -10,6 +10,7 @@ Architecture:
 
 from __future__ import annotations
 
+import collections
 import ctypes
 import os
 import subprocess
@@ -31,6 +32,10 @@ PROFILES         = SCRIPT_DIR / "profiles.default.txt"
 RKN_SILENT_FLAG  = SCRIPT_DIR / "cache" / "autocircular" / "rkn_silent_fallback.flag"
 TG_PROXY_EXE     = SCRIPT_DIR / "tg-transparent.exe"
 UI_INDEX         = RES_DIR / "ui" / "index.html"
+WINWS_LOG_FILE   = SCRIPT_DIR / "z2w-winws.log"  # rolling log, truncated each start
+
+# How many trailing stderr lines to keep in RAM for crash-report popup.
+STDERR_TAIL_LINES = 80
 
 VERSION = "1.4.1"
 
@@ -156,6 +161,69 @@ def _ensure_instagram_dns() -> None:
     except OSError:
         pass
 
+class _StderrDrain(threading.Thread):
+    """
+    Continuously read winws2's stderr.
+
+    WHY: winws2 (bol-van zapret2) writes diagnostic lines to stderr via
+    DLOG_ERR / DLOG_CONDUP regardless of --debug verbosity — nfqws.c
+    alone has 154 such call-sites that fire on hostlist warnings, IP
+    cache events, parse errors, OOM, etc. The default Windows pipe
+    buffer is 4-64 KB; without continuous draining it fills within
+    minutes of active traffic, and the next fwrite(stderr) inside
+    winws2 BLOCKS — packet processing halts and users see the bypass
+    "stop responding".
+
+    Each instance:
+      • Mirrors raw stderr bytes into a rolling log file on disk
+        (truncated on every start) — useful for support reports.
+      • Keeps the last STDERR_TAIL_LINES decoded lines in memory so
+        the crash callback can show recent context to the user.
+    """
+
+    def __init__(self, stream, log_path: Path | None) -> None:
+        super().__init__(daemon=True, name="winws2-stderr-drain")
+        self.stream = stream
+        self.log_path = log_path
+        self.lines: collections.deque[str] = collections.deque(maxlen=STDERR_TAIL_LINES)
+
+    def run(self) -> None:
+        log_fh = None
+        if self.log_path is not None:
+            try:
+                log_fh = self.log_path.open("wb")
+            except OSError:
+                log_fh = None
+        try:
+            for raw in iter(self.stream.readline, b""):
+                if not raw:
+                    break
+                if log_fh is not None:
+                    try:
+                        log_fh.write(raw)
+                        log_fh.flush()
+                    except Exception:
+                        try:
+                            log_fh.close()
+                        except Exception:
+                            pass
+                        log_fh = None
+                self.lines.append(raw.decode("utf-8", errors="replace").rstrip())
+        except Exception:
+            pass
+        finally:
+            if log_fh is not None:
+                try:
+                    log_fh.close()
+                except Exception:
+                    pass
+
+    def tail(self, n: int = 12) -> str:
+        if not self.lines:
+            return ""
+        return "\n".join(list(self.lines)[-n:])[-1500:]
+
+
 def _unblock_files() -> None:
     for name in _UNBLOCK_NAMES:
         path = SCRIPT_DIR / name
@@ -175,6 +243,7 @@ class Api:
     def __init__(self) -> None:
         self.window = None
         self.process: subprocess.Popen | None = None
+        self.stderr_drain: _StderrDrain | None = None
         self.tg_proxy_proc: subprocess.Popen | None = None
         self.tg_enabled = False
 
@@ -209,12 +278,18 @@ class Api:
                 cwd=str(SCRIPT_DIR),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
+                bufsize=0,  # we read line-by-line in the drain thread
                 creationflags=CREATE_NO_WINDOW,
             )
         except FileNotFoundError as exc:
             return {"ok": False, "err": f"File not found: {Path(str(exc)).name}"}
         except Exception as exc:
             return {"ok": False, "err": str(exc)}
+
+        # CRITICAL: drain stderr continuously so the OS pipe buffer never fills.
+        # See _StderrDrain docstring for the failure mode this prevents.
+        self.stderr_drain = _StderrDrain(self.process.stderr, WINWS_LOG_FILE)
+        self.stderr_drain.start()
 
         if self.tg_enabled:
             self._start_tg_proxy()
@@ -233,6 +308,8 @@ class Api:
                     proc.kill()
                 except Exception:
                     pass
+        # Drain thread exits naturally on stderr EOF (after the kill above).
+        self.stderr_drain = None
         _kill_stale("winws2.exe")
         self._stop_tg_proxy()
         return {"ok": True}
@@ -304,6 +381,7 @@ class Api:
     def _watch(self) -> None:
         """Wait for winws2 to exit; if it crashed, push a JS notification."""
         proc = self.process
+        drain = self.stderr_drain
         if proc is None:
             return
         try:
@@ -312,14 +390,15 @@ class Api:
             return
         if self.process is not proc:
             return  # superseded by stop()
-        msg = ""
-        try:
-            data = proc.stderr.read() if proc.stderr else b""
-            if data:
-                msg = data.decode("utf-8", errors="replace").strip()[-300:]
-        except Exception:
-            pass
+
+        # Give the drain thread a brief window to flush the final lines.
+        if drain is not None:
+            drain.join(timeout=0.5)
+
+        msg = drain.tail(12) if drain is not None else ""
+
         self.process = None
+        self.stderr_drain = None
         if self.window is not None:
             try:
                 self.window.evaluate_js(f"window.onWinwsCrash({_js_string(msg)})")
