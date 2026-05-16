@@ -34,7 +34,7 @@ else:
 WINWS_EXE        = SCRIPT_DIR / "winws2.exe"
 PROFILES         = SCRIPT_DIR / "profiles.default.txt"
 RKN_SILENT_FLAG  = SCRIPT_DIR / "cache" / "autocircular" / "rkn_silent_fallback.flag"
-TG_PROXY_EXE     = SCRIPT_DIR / "tg-transparent.exe"
+TG_PROXY_EXE     = SCRIPT_DIR / "tg-mtproxy.exe"
 TG_ENABLED_FLAG  = SCRIPT_DIR / "cache" / "tg_enabled.flag"    # persists toggle across restarts
 UI_INDEX         = RES_DIR / "ui" / "index.html"
 WINWS_CONF_FILE  = SCRIPT_DIR / "cache" / "winws2.conf"        # runtime argv → @<config_file>
@@ -74,7 +74,7 @@ VERSION = "1.4.1"
 
 _UNBLOCK_NAMES = [
     "winws2.exe", "cygwin1.dll", "WinDivert.dll", "WinDivert64.sys",
-    "tg-transparent.exe",
+    "tg-mtproxy.exe",
 ]
 
 HOSTS_FILE = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "drivers" / "etc" / "hosts"
@@ -613,8 +613,8 @@ class Api:
         # failure path so the user has to re-toggle explicitly once the
         # exe is back.
         if want and not TG_PROXY_EXE.exists():
-            self._tg_emit("error", "tg-transparent.exe не найден рядом с z2w.exe")
-            return {"ok": False, "err": "tg-transparent.exe не найден"}
+            self._tg_emit("error", "tg-mtproxy.exe не найден рядом с z2w.exe")
+            return {"ok": False, "err": "tg-mtproxy.exe не найден"}
 
         self.tg_enabled = want
         # Persist across z2w restarts (mirrors TG_PROXY_USER_DISABLED).
@@ -716,7 +716,7 @@ class Api:
             pass
 
     def _tg_start(self) -> None:
-        """Spawn tg-transparent.exe + start drain + spawn watchdog.
+        """Spawn tg-mtproxy.exe + start drain + spawn watchdog.
         Re-checks self.tg_enabled under the lock to handle the on→off race
         when this fn is invoked via background thread from set_tg_enabled."""
         with self._tg_lock:
@@ -734,23 +734,34 @@ class Api:
                 # was quarantined/deleted. Clear persistent state under the
                 # same lock so the next z2w launch doesn't blindly autostart.
                 self._tg_give_up()
-                self._tg_emit("error", "tg-transparent.exe не найден")
+                self._tg_emit("error", "tg-mtproxy.exe не найден")
                 return
 
             _unblock_files()
-            _kill_stale("tg-transparent.exe")  # clean any orphan
+            _kill_stale("tg-mtproxy.exe")  # clean any orphan
+
+            # Forward optional tunnel-config envs into the proxy process.
+            # tg-mtproxy.exe has the production VPS endpoint baked-in as
+            # defaults — these vars are an explicit override path for ad-hoc
+            # routing (e.g. a staging relay) without rebuilding the binary.
+            env = os.environ.copy()
+            for k in ("Z2W_TUNNEL_URL", "Z2W_TUNNEL_SECRET"):
+                v = os.environ.get(k)
+                if v:
+                    env[k] = v
 
             try:
                 self.tg_proc = subprocess.Popen(
                     [str(TG_PROXY_EXE)],
                     cwd=str(SCRIPT_DIR),
+                    env=env,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
                     bufsize=0,
                     creationflags=CREATE_NO_WINDOW,
                 )
             except Exception as exc:
-                self._tg_emit("error", f"Не удалось запустить tg-transparent: {exc}")
+                self._tg_emit("error", f"Не удалось запустить tg-mtproxy: {exc}")
                 return
 
             self.tg_stderr_drain = _StderrDrain(
@@ -793,7 +804,7 @@ class Api:
                     proc.kill()
                 except Exception:
                     pass
-        _kill_stale("tg-transparent.exe")
+        _kill_stale("tg-mtproxy.exe")
 
     def _tg_stop(self, persist: bool = True) -> None:
         """User-initiated stop. Kills proc + emits 'stopped'.
@@ -828,8 +839,8 @@ class Api:
             # Don't loop-restart on immediate crash AND don't autostart next
             # session — UI now shows error+unchecked, backend must match.
             self._tg_give_up()
-        msg = f"tg-transparent умер сразу после старта: {tail}" if tail \
-              else "tg-transparent умер сразу после старта (см. z2w-tg.log)"
+        msg = f"tg-mtproxy умер сразу после старта: {tail}" if tail \
+              else "tg-mtproxy умер сразу после старта (см. z2w-tg.log)"
         self._tg_emit("error", msg)
 
     def _tg_watchdog(self) -> None:
@@ -871,7 +882,7 @@ class Api:
 
     def _tg_probe(self) -> bool:
         """TLS handshake to Telegram (TG_PROBE_HOST resolved to TG_PROBE_IP).
-        If WinDivert+tg-transparent are healthy, TG IP traffic goes through
+        If WinDivert+tg-mtproxy are healthy, TG IP traffic goes through
         the tunnel and succeeds. Failure = tunnel broken."""
         try:
             ctx = ssl.create_default_context()
@@ -892,7 +903,7 @@ class Api:
             self._tg_restart_log.popleft()
         if len(self._tg_restart_log) >= TG_RESTART_BUDGET:
             # CRITICAL: kill the broken proc BEFORE emitting error. stderr-storm
-            # and probe-fail branches reach here with a live tg-transparent.exe
+            # and probe-fail branches reach here with a live tg-mtproxy.exe
             # still holding its WinDivert handle — without this kill it leaks
             # past give-up and continues intercepting TG traffic with no logic
             # behind it. Silent kill (no 'stopped' emit) so the final 'error'
@@ -903,7 +914,7 @@ class Api:
                 # disk flag, and UI checkbox must agree across z2w restarts.
                 self._tg_give_up()
             self._tg_emit("error",
-                          f"tg-transparent: {TG_RESTART_BUDGET} рестартов за "
+                          f"tg-mtproxy: {TG_RESTART_BUDGET} рестартов за "
                           f"{TG_RESTART_BUDGET_WIN}с — даю отбой. См. z2w-tg.log")
             return
 

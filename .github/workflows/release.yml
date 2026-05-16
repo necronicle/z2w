@@ -38,6 +38,26 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build tg-mtproxy.exe
+        shell: pwsh
+        run: |
+          # Windows port of z2k's mtproxy-client + WinDivert NAT.
+          # See tools/tg-mtproxy/main.go for protocol/env-config docs.
+          $ErrorActionPreference = "Stop"
+          Push-Location tools\tg-mtproxy
+          try {
+            go build -trimpath -ldflags="-s -w" -o ..\..\tg-mtproxy.exe .
+          } finally {
+            Pop-Location
+          }
+          $size = [math]::Round((Get-Item tg-mtproxy.exe).Length / 1MB, 1)
+          Write-Host "tg-mtproxy.exe — $size MB"
+
       - name: Install dependencies
         run: pip install pyinstaller pillow pywebview pywin32 pystray
 
