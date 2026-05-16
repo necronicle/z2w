@@ -160,12 +160,16 @@ def _kill_stale(image: str) -> None:
         pass
 
 def _build_args() -> list[str]:
+    """BASE_ARGS + one profile per non-comment line of profiles.default.txt.
+    Comments (#-prefixed) and blank lines are skipped — profiles.default.txt
+    is generator output (tools/build_profiles.py) and carries a header."""
     args = list(BASE_ARGS)
     with open(PROFILES, encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
-            if line:
-                args.extend(line.split())
+            if not line or line.startswith("#"):
+                continue
+            args.extend(line.split())
     return args
 
 def _ensure_instagram_dns() -> None:
@@ -480,9 +484,30 @@ class Api:
         except Exception:
             pass
 
+    def _tg_give_up(self) -> None:
+        """Persistent give-up: clear tg_enabled + remove flag + stop watchdog.
+        Used on immediate crash and on restart-budget exhaustion. Without this,
+        the next z2w launch reads the flag and autostarts a broken tunnel."""
+        self.tg_enabled = False
+        self.tg_want_running = False
+        try:
+            TG_ENABLED_FLAG.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
     def _tg_start(self) -> None:
-        """Spawn tg-transparent.exe + start drain + spawn watchdog."""
+        """Spawn tg-transparent.exe + start drain + spawn watchdog.
+        Re-checks self.tg_enabled under the lock to handle the on→off race
+        when this fn is invoked via background thread from set_tg_enabled."""
         with self._tg_lock:
+            # Race guard: user may have toggled off before this thread ran.
+            # Both set_tg_enabled(False) (clears tg_enabled+flag) and an
+            # explicit _tg_stop (clears tg_want_running) can happen between
+            # the threading.Thread(...).start() and this lock acquisition.
+            if not self.tg_enabled:
+                return
             if self._tg_alive():
                 return  # already running
             if not TG_PROXY_EXE.exists():
@@ -567,7 +592,9 @@ class Api:
         with self._tg_lock:
             self.tg_proc = None
             self.tg_stderr_drain = None
-            self.tg_want_running = False  # don't loop-restart on immediate crash
+            # Don't loop-restart on immediate crash AND don't autostart next
+            # session — UI now shows error+unchecked, backend must match.
+            self._tg_give_up()
         msg = f"tg-transparent умер сразу после старта: {tail}" if tail \
               else "tg-transparent умер сразу после старта (см. z2w-tg.log)"
         self._tg_emit("error", msg)
@@ -632,7 +659,9 @@ class Api:
             self._tg_restart_log.popleft()
         if len(self._tg_restart_log) >= TG_RESTART_BUDGET:
             with self._tg_lock:
-                self.tg_want_running = False
+                # Same persistent give-up as immediate crash — backend state,
+                # disk flag, and UI checkbox must agree across z2w restarts.
+                self._tg_give_up()
             self._tg_emit("error",
                           f"tg-transparent: {TG_RESTART_BUDGET} рестартов за "
                           f"{TG_RESTART_BUDGET_WIN}с — даю отбой. См. z2w-tg.log")

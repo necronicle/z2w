@@ -35,6 +35,20 @@ jobs:
       - name: Install dependencies
         run: pip install pyinstaller pillow pywebview pywin32
 
+      - name: Verify profiles.default.txt matches generator output
+        shell: pwsh
+        run: |
+          # Regenerate from vendored z2k sources and fail if the committed
+          # file drifted (e.g. hand-edit, stale vendor sync). Tools is pure
+          # stdlib Python — no extra installs.
+          python tools\build_profiles.py
+          git diff --exit-code -- profiles.default.txt
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::profiles.default.txt is out of sync with tools/build_profiles.py output."
+            Write-Host "Re-run 'python3 tools/build_profiles.py' locally and commit the result."
+            exit 1
+          }
+
       - name: Generate icon
         shell: python
         run: |
