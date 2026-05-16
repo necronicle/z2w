@@ -349,6 +349,34 @@ HEADER = (
 )
 
 
+# ─── Runtime config-size guard ────────────────────────────────────────────────
+# z2w starts winws2 via `winws2.exe @cache/winws2.conf`. The conf file is
+# generated at runtime as BASE_ARGS + one profile per line of this output,
+# shell-quoted (one token per line). winws2's config_from_file() loads it
+# into a static char buf[MAX_CONFIG_FILE_SIZE] minus 3 bytes preamble.
+#
+# Fork necronicle/zapret2-z2k v0.9.5.2-z2k-r3 bumped MAX_CONFIG_FILE_SIZE
+# from 16384 → 65536. We guard here so a future z2k sync that blows past
+# 65533 - BASE_ARGS_RESERVE fails CI immediately instead of producing a
+# z2w build that silently truncates strategies mid-token at first launch.
+WINWS_CONF_CAP    = 65536 - 3
+BASE_ARGS_RESERVE = 2048   # generous: actual BASE_ARGS today ≈ 1400 bytes
+
+
+def _simulated_runtime_config_size(profile_lines: list[str]) -> int:
+    """Estimate `cache/winws2.conf` size for the upcoming runtime invocation.
+    Mirrors _write_winws_config() in z2k_gui.py: each token shell-quoted on
+    its own line. We approximate via raw byte count + 1 for newline since
+    our profile args don't contain chars shlex.quote() needs to escape (no
+    spaces, quotes, $/`/backslashes); the rare exception (<5 bytes per
+    string) is dwarfed by BASE_ARGS_RESERVE."""
+    # Each profile line is multiple space-separated tokens that become
+    # one-token-per-line in the conf. Total bytes ≈ same count: spaces
+    # become newlines, no change in length.
+    profile_bytes = sum(len(line) + 1 for line in profile_lines)
+    return profile_bytes + BASE_ARGS_RESERVE
+
+
 def main() -> None:
     out_lines: list[str] = []
     for name, fn in PROFILES:
@@ -358,6 +386,19 @@ def main() -> None:
         out_lines.append(line)
     OUTPUT.write_text(HEADER + "\n".join(out_lines) + "\n", encoding="utf-8")
     print(f"\nWrote {OUTPUT}  ({len(out_lines)} profiles)")
+
+    # Fail loud if we're close to the fork's MAX_CONFIG_FILE_SIZE.
+    sim = _simulated_runtime_config_size(out_lines)
+    headroom = WINWS_CONF_CAP - sim
+    pct = 100.0 * sim / WINWS_CONF_CAP
+    print(f"\nRuntime config size: ~{sim} B  /  cap {WINWS_CONF_CAP} B  "
+          f"({pct:.1f}% used, {headroom} B headroom)")
+    if sim > WINWS_CONF_CAP:
+        raise SystemExit(
+            f"\nFATAL: estimated runtime config {sim} B exceeds fork cap "
+            f"{WINWS_CONF_CAP} B. Bump MAX_CONFIG_FILE_SIZE in fork "
+            f"necronicle/zapret2-z2k nfq2/nfqws.c and rebuild winws2.exe."
+        )
 
 
 if __name__ == "__main__":

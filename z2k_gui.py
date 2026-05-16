@@ -13,6 +13,7 @@ from __future__ import annotations
 import collections
 import ctypes
 import os
+import shlex
 import socket
 import ssl
 import subprocess
@@ -36,11 +37,19 @@ RKN_SILENT_FLAG  = SCRIPT_DIR / "cache" / "autocircular" / "rkn_silent_fallback.
 TG_PROXY_EXE     = SCRIPT_DIR / "tg-transparent.exe"
 TG_ENABLED_FLAG  = SCRIPT_DIR / "cache" / "tg_enabled.flag"    # persists toggle across restarts
 UI_INDEX         = RES_DIR / "ui" / "index.html"
+WINWS_CONF_FILE  = SCRIPT_DIR / "cache" / "winws2.conf"        # runtime argv → @<config_file>
 WINWS_LOG_FILE   = SCRIPT_DIR / "z2w-winws.log"      # current session log
 WINWS_LOG_OLD    = SCRIPT_DIR / "z2w-winws.log.1"    # previous rotation
 WINWS_LOG_CAP    = 2 * 1024 * 1024                   # 2 MB per file
 TG_LOG_FILE      = SCRIPT_DIR / "z2w-tg.log"
 TG_LOG_OLD       = SCRIPT_DIR / "z2w-tg.log.1"
+
+# winws2 config_from_file() uses static buf[MAX_CONFIG_FILE_SIZE] minus a
+# 3-byte preamble ("x " fake argv[0] + NUL). Fork bumped this define to 65536
+# in v0.9.5.2-z2k-r3; older forks topped out at 16384. We guard against
+# regression on fork bumps by validating against the smaller of the two
+# values that our build still expects.
+WINWS_CONF_CAP   = 65536 - 3
 
 # How many trailing stderr lines to keep in RAM for crash-report popup.
 STDERR_TAIL_LINES = 80
@@ -159,18 +168,45 @@ def _kill_stale(image: str) -> None:
     except Exception:
         pass
 
-def _build_args() -> list[str]:
-    """BASE_ARGS + one profile per non-comment line of profiles.default.txt.
-    Comments (#-prefixed) and blank lines are skipped — profiles.default.txt
-    is generator output (tools/build_profiles.py) and carries a header."""
-    args = list(BASE_ARGS)
+def _write_winws_config() -> Path:
+    """Compose BASE_ARGS + profiles into a runtime config file that winws2
+    reads via the @<config_file> CLI syntax.
+
+    WHY: the full argv (BASE_ARGS + 7 profiles after the strats_new2.txt
+    port) is ~33 KB. Windows CreateProcess caps cmdline at 32767 chars,
+    so passing argv directly fails with WinError 206. With @<config_file>
+    the actual cmdline becomes just `winws2.exe @cache/winws2.conf` —
+    well under the limit — while nfqws reads the full args from disk.
+
+    FORMAT: one shell-quoted token per line. nfqws's config_from_file()
+    replaces \\n/\\r/\\t with spaces, prepends a fake `x ` argv[0], then
+    runs the buffer through wordexp() — so shlex.quote() (POSIX-quoting)
+    is the right escape for any token that could need it.
+
+    SIZE GUARD: fork's MAX_CONFIG_FILE_SIZE is 65536 (post v0.9.5.2-z2k-r3
+    bump from 16384). We assert against (cap - 3) since nfqws prepends
+    `x ` (2 bytes) + NUL terminator (1 byte). On overflow we raise so
+    the caller surfaces a clear error instead of silently truncating
+    the config mid-token."""
+    WINWS_CONF_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    args: list[str] = list(BASE_ARGS)
     with open(PROFILES, encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
             args.extend(line.split())
-    return args
+
+    content = "\n".join(shlex.quote(a) for a in args) + "\n"
+    size = len(content.encode("utf-8"))
+    if size > WINWS_CONF_CAP:
+        raise RuntimeError(
+            f"winws2 config {size}B > {WINWS_CONF_CAP}B cap "
+            f"(MAX_CONFIG_FILE_SIZE in fork). Bump the fork."
+        )
+    WINWS_CONF_FILE.write_text(content, encoding="utf-8")
+    return WINWS_CONF_FILE
 
 def _ensure_instagram_dns() -> None:
     try:
@@ -356,15 +392,21 @@ class Api:
             _kill_stale("winws2.exe")
             _ensure_instagram_dns()
             _unblock_files()
-            args = _build_args()
+            conf_path = _write_winws_config()
+            # CRITICAL: winws2's @<config_file> must be the SOLE argument
+            # (nfqws.c:1806 "other options are ignored"). All BASE_ARGS +
+            # profiles live inside the file.
             self.process = subprocess.Popen(
-                [str(WINWS_EXE), *args],
+                [str(WINWS_EXE), f"@{conf_path}"],
                 cwd=str(SCRIPT_DIR),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 bufsize=0,  # we read line-by-line in the drain thread
                 creationflags=CREATE_NO_WINDOW,
             )
+        except RuntimeError as exc:
+            # Config size guard tripped.
+            return {"ok": False, "err": str(exc)}
         except FileNotFoundError as exc:
             return {"ok": False, "err": f"File not found: {Path(str(exc)).name}"}
         except Exception as exc:
