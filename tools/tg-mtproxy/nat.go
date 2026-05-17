@@ -108,7 +108,16 @@ func startNAT() error {
 		log.Printf("WinDivert filter: %s", filter)
 	}
 
-	handle, err := divert.Open(filter, divert.LayerNetwork, int16(0), divert.FlagDefault)
+	// Priority 1000: higher than winws2 (default 0). When both are running,
+	// our filter (TG-CIDR + loopback:1443) is intentionally NARROWER than
+	// winws2's --wf-tcp-out=80,443,2053,2083,2087,2096,8443 — so they
+	// overlap only on TG-CIDR/443. We MUST be processed first there: we
+	// NAT the packet to loopback and reinject; the result no longer
+	// matches winws2's filter (dst port = 1443) and never reaches it.
+	// For non-TG outbound, our filter doesn't match → winws2 sees those
+	// untouched and applies its DPI strategies normally.
+	const windivertPriority int16 = 1000
+	handle, err := divert.Open(filter, divert.LayerNetwork, windivertPriority, divert.FlagDefault)
 	if err != nil {
 		return fmt.Errorf("WinDivertOpen: %w (ensure WinDivert.dll + WinDivert64.sys are alongside the .exe and process is admin)", err)
 	}
