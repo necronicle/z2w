@@ -61,14 +61,19 @@ const (
 	natEntryTTL    = 5 * time.Minute
 )
 
-type natKey struct {
-	SrcIP   [4]byte
-	SrcPort uint16
-}
+// natKey is the client's ephemeral source port. Since z2w runs on the
+// client machine itself, srcPort alone is unique per active TCP flow
+// (Windows guarantees uniqueness across local-binds during a port's
+// lifetime). Keying on port only also dodges the awkward asymmetry that
+// the forward path captures the real LAN IP while the listener sees
+// 127.0.0.1 (we rewrite both src and dst to localhost — see
+// natCaptureLoop below).
+type natKey uint16
 
 type natEntry struct {
-	OrigDstIP   [4]byte
-	OrigDstPort uint16
+	OrigDstIP   [4]byte // TG DC IPv4
+	OrigDstPort uint16  // always 443 (TG MTProto) but kept generic
+	LocalSrcIP  [4]byte // client's LAN IP — needed to rewrite reverse path
 	LastSeen    time.Time
 }
 
@@ -77,21 +82,15 @@ var (
 	natTab = map[natKey]*natEntry{}
 )
 
-// lookupOriginalDst is called by the local listener via remote addr of an
-// accepted TCP connection. Returns origDst, ok.
+// lookupOriginalDst is called by the local listener after Accept().
+// remote.Port is the original client ephemeral port (preserved through
+// NAT rewrite).
 func lookupOriginalDst(remote *net.TCPAddr) (net.IP, int, bool) {
 	if remote == nil {
 		return nil, 0, false
 	}
-	v4 := remote.IP.To4()
-	if v4 == nil {
-		return nil, 0, false
-	}
-	key := natKey{SrcPort: uint16(remote.Port)}
-	copy(key.SrcIP[:], v4)
-
 	natMu.RLock()
-	e, ok := natTab[key]
+	e, ok := natTab[natKey(remote.Port)]
 	natMu.RUnlock()
 	if !ok {
 		return nil, 0, false
@@ -183,15 +182,23 @@ func natCaptureLoop(h *divert.Handle) {
 
 		switch {
 		case dstPort == 443:
-			// Forward path: client → TG_IP:443. Save mapping on SYN,
-			// rewrite dst to 127.0.0.1:1443.
+			// Forward path: client → TG_IP:443.
+			//
+			// On SYN, snapshot (LAN IP, orig TG IP) so the reverse path can
+			// rewrite the reply's src+dst back to what the client's TCP
+			// stack expects. Rewrite BOTH src and dst to 127.0.0.1 so the
+			// kernel routes the packet through the loopback adapter — a
+			// real-LAN src with a loopback dst is rejected by Windows
+			// (loopback only accepts 127.0.0.0/8 source). client_src_port
+			// is preserved as the flow identifier (used to look up the
+			// natTab entry from listener.Accept().RemoteAddr.Port).
 			isSYN := flags&0x02 != 0
 			if isSYN {
-				key := natKey{SrcIP: srcIP, SrcPort: srcPort}
 				natMu.Lock()
-				natTab[key] = &natEntry{
+				natTab[natKey(srcPort)] = &natEntry{
 					OrigDstIP:   dstIP,
 					OrigDstPort: dstPort,
+					LocalSrcIP:  srcIP,
 					LastSeen:    time.Now(),
 				}
 				natMu.Unlock()
@@ -200,33 +207,34 @@ func natCaptureLoop(h *divert.Handle) {
 						ipStr(srcIP), srcPort, ipStr(dstIP), dstPort, localRelayPort)
 				}
 			}
-			// Rewrite dst → 127.0.0.1:1443.
-			pkt[16], pkt[17], pkt[18], pkt[19] = 127, 0, 0, 1
+			pkt[12], pkt[13], pkt[14], pkt[15] = 127, 0, 0, 1 // src → 127.0.0.1
+			pkt[16], pkt[17], pkt[18], pkt[19] = 127, 0, 0, 1 // dst → 127.0.0.1
 			binary.BigEndian.PutUint16(tcp[2:4], localRelayPort)
+			// src_port preserved (flow id)
 
 		case srcPort == localRelayPort &&
 			srcIP[0] == 127 && srcIP[1] == 0 && srcIP[2] == 0 && srcIP[3] == 1:
-			// Reply path: 127.0.0.1:1443 → client. Look up natTab by
-			// (dstIP, dstPort) — that's the client's local addr. Rewrite
-			// src to original TG_IP:443 so the client's TCP stack accepts it.
-			key := natKey{SrcIP: dstIP, SrcPort: dstPort}
+			// Reply path: 127.0.0.1:1443 → 127.0.0.1:ephem. Look up the
+			// natTab entry by dst_port (= client's original ephemeral
+			// port) and rewrite the packet's src to look like a reply
+			// from TG_IP:443 and the dst to the client's real LAN IP —
+			// otherwise the client's socket would discard it.
+			key := natKey(dstPort)
 			natMu.RLock()
 			e, ok := natTab[key]
 			natMu.RUnlock()
 			if !ok {
-				// No mapping — packet to localhost we don't know about.
-				// Could be unrelated loopback traffic on port 1443. Pass through.
+				// Unrelated loopback traffic on port 1443. Pass through.
 				_, _ = h.Send(pkt, &addr)
 				continue
 			}
-			// Refresh TTL on traffic.
 			natMu.Lock()
 			e.LastSeen = time.Now()
 			natMu.Unlock()
-			copy(pkt[12:16], e.OrigDstIP[:])
+			copy(pkt[12:16], e.OrigDstIP[:])  // src → orig TG_IP
+			copy(pkt[16:20], e.LocalSrcIP[:]) // dst → client LAN IP
 			binary.BigEndian.PutUint16(tcp[0:2], e.OrigDstPort)
-			// Evict on FIN/RST so the table doesn't accumulate.
-			if flags&0x05 != 0 { // FIN|RST
+			if flags&0x05 != 0 { // FIN|RST → evict
 				natMu.Lock()
 				delete(natTab, key)
 				natMu.Unlock()
