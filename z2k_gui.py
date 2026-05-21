@@ -70,7 +70,7 @@ TG_STDERR_FAIL_MARKERS  = (
     "fatal error:", "panic:",
 )
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 
 _UNBLOCK_NAMES = [
     "winws2.exe", "cygwin1.dll", "WinDivert.dll", "WinDivert64.sys",
@@ -326,15 +326,25 @@ class _StderrDrain(threading.Thread):
 
 
 def _unblock_files() -> None:
+    """Strip Mark-of-the-Web by deleting each file's `:Zone.Identifier`
+    Alternate Data Stream.
+
+    Old impl spawned `powershell.exe Unblock-File` once per file. On Win11
+    with Defender real-time scan that's 1–3s of .NET host warm-up × 5 files,
+    which fired on every Start click and looked like the app hung. ADS
+    removal via the Win32 file API is the same effect (Unblock-File is
+    literally `DeleteFile path:Zone.Identifier` inside .NET) but with zero
+    process-creation cost — total time is now sub-millisecond."""
     for name in _UNBLOCK_NAMES:
         path = SCRIPT_DIR / name
-        if path.exists():
-            subprocess.run(
-                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                 "-Command",
-                 f"Unblock-File -LiteralPath '{path}' -ErrorAction SilentlyContinue"],
-                capture_output=True, creationflags=CREATE_NO_WINDOW,
-            )
+        if not path.exists():
+            continue
+        try:
+            os.remove(f"{path}:Zone.Identifier")
+        except FileNotFoundError:
+            pass  # not blocked (no MOTW ADS) — already clean
+        except OSError:
+            pass  # locked / permission denied — silent like the old -ErrorAction SilentlyContinue
 
 # ─── System-tray manager (pystray + win32) ────────────────────────────────────
 
