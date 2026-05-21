@@ -234,13 +234,26 @@ def build_gv_tcp() -> str:
     s = ensure_circular_nld2(s)
     s = ensure_circular_tcp_inseq(s, 18000)
     s = ensure_circular_arg_set(s, "success_detector", "z2k_http_success_positive_only")
-    s = ensure_circular_arg_set(s, "failure_detector", "z2k_silent_drop_detector")
+    # gv_tcp uses tls_alert_fatal (not silent_drop_detector). googlevideo is
+    # HTTP/2 over TLS — bulk CDN where the client legitimately bursts H2 frames
+    # (range / WINDOW_UPDATE / SETTINGS) while the server flight is still
+    # chunking Cert+EE+Finished. silent_drop_detector's heuristic
+    # (out>=4 && in<=1 && in_bytes<16384) was tripping during normal video
+    # playback (gv_tcp rotating strat 3→…→8 in minutes). tls_alert_fatal
+    # delegates a chain (z2k_tls_stalled covers handshake CH-without-SH) so
+    # handshake-time silent drops still get caught through a different path.
+    # Mirrors z2k @9d69b9f.
+    s = ensure_circular_arg_set(s, "failure_detector", "z2k_tls_alert_fatal")
     s = ensure_circular_arg_set(s, "no_http_redirect", "")
     s = inject_z2k_dynamic_ttl(s)
     s = strip_dead_range_args(s)
     s = inject_z2k_range_rand(s)
     s = assemble(s, GV_IN_RANGE_BYTES)
-    prefix = "--hostlist-exclude=hostlists/whitelist.txt --hostlist-domains=googlevideo.com"
+    # Was --hostlist-domains=googlevideo.com (inline). Switched to a shipped
+    # hostlist file so users can extend the list without rebuilding (mirrors
+    # z2k @34579a1 r-17 v2 — dedicated YT_GV/List.txt).
+    prefix = ("--hostlist-exclude=hostlists/whitelist.txt "
+              "--hostlist=hostlists/TCP_YT_GV_List.txt")
     return f"{prefix} {s} --new"
 
 
