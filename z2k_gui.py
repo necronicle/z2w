@@ -325,6 +325,45 @@ class _StderrDrain(threading.Thread):
         return "\n".join(list(self.lines)[-n:])[-1500:]
 
 
+def _short_path(p: Path | str) -> str:
+    """Resolve a Windows 8.3 short path (e.g. ``Program Files (x86)`` →
+    ``PROGRA~2``).
+
+    winws2.exe is a Cygwin-linked binary, and cygwin1.dll's ``path_conv``
+    layer has a long tail of edge-case SIGSEGVs when fed paths containing
+    spaces, parentheses, Cyrillic characters, or anything else it isn't
+    fully prepared for in the current runtime. We've hit this trio of
+    failures in the field:
+
+      * Cyrillic install path — STATUS_ACCESS_VIOLATION at startup
+      * ``C:\\Program Files (x86)\\z2w\\`` — same, with Windhawk in
+        the mix it became reproducible without Cyrillic
+      * Heap-hook injectors (Windhawk) corrupt path_conv's internal
+        state when paths are long-form
+
+    Passing the 8.3 short form for the launch triplet (exe, cwd, ``@<config>``
+    arg) gives cygwin a pure-ASCII no-spaces no-parens cwd to anchor every
+    relative path inside the config (``hostlists/``, ``lua/``, ``files/`` …)
+    against. The fix is non-invasive: if short names are disabled on the
+    volume (group policy / fsutil 8dot3name set 1), GetShortPathNameW
+    returns 0 and we fall back to the long path — same behaviour as today.
+    """
+    p = str(p)
+    try:
+        GetShortPathNameW = ctypes.windll.kernel32.GetShortPathNameW
+        GetShortPathNameW.restype = ctypes.c_uint32
+        GetShortPathNameW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+        n = GetShortPathNameW(p, None, 0)
+        if n == 0:
+            return p
+        buf = ctypes.create_unicode_buffer(n)
+        if GetShortPathNameW(p, buf, n) == 0:
+            return p
+        return buf.value
+    except Exception:
+        return p
+
+
 def _unblock_files() -> None:
     """Strip Mark-of-the-Web by deleting each file's `:Zone.Identifier`
     Alternate Data Stream.
@@ -562,12 +601,35 @@ class Api:
             _ensure_instagram_dns()
             _unblock_files()
             conf_path = _write_winws_config()
+
+            # All three paths handed to winws2 go through GetShortPathNameW —
+            # see _short_path() docstring for the failure modes this prevents.
+            short_exe  = _short_path(WINWS_EXE)
+            short_conf = _short_path(conf_path)
+            short_cwd  = _short_path(SCRIPT_DIR)
+
+            # Post short-resolve, the cwd must be pure ASCII — cygwin's
+            # path_conv crashes on Cyrillic even with short names (some
+            # NTFS volumes don't synthesise ASCII 8.3 aliases for Cyrillic
+            # dirs). If it still isn't, fail loudly with actionable advice
+            # instead of letting winws2 SIGSEGV inside cygwin1.dll.
+            try:
+                short_cwd.encode("ascii")
+            except UnicodeEncodeError:
+                return {"ok": False, "err": (
+                    "z2w установлен по пути с не-ASCII символами:\n"
+                    f"  {SCRIPT_DIR}\n\n"
+                    "winws2 использует cygwin runtime, который падает "
+                    "на таких путях.\n"
+                    "Перенеси z2w в простой ASCII-путь — например C:\\z2w\\"
+                )}
+
             # CRITICAL: winws2's @<config_file> must be the SOLE argument
             # (nfqws.c:1806 "other options are ignored"). All BASE_ARGS +
             # profiles live inside the file.
             self.process = subprocess.Popen(
-                [str(WINWS_EXE), f"@{conf_path}"],
-                cwd=str(SCRIPT_DIR),
+                [short_exe, f"@{short_conf}"],
+                cwd=short_cwd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 bufsize=0,  # we read line-by-line in the drain thread
@@ -760,10 +822,14 @@ class Api:
                 if v:
                     env[k] = v
 
+            # Same short-path treatment as winws2 — tg-mtproxy is pure Go
+            # (not cygwin-linked) so the path_conv risk doesn't apply, but
+            # the call site stays uniform and a DLL-injection hook that
+            # corrupts the long-path may equally well misbehave here.
             try:
                 self.tg_proc = subprocess.Popen(
-                    [str(TG_PROXY_EXE)],
-                    cwd=str(SCRIPT_DIR),
+                    [_short_path(TG_PROXY_EXE)],
+                    cwd=_short_path(SCRIPT_DIR),
                     env=env,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,

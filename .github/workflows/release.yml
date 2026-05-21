@@ -169,7 +169,15 @@ jobs:
           # + lua/ + files/ + hostlists/ + windivert.filter/ + cache/conf.
           # No bash.exe, no sh.exe — same as what the user actually gets
           # from z2w.zip.
-          $stage = "$env:RUNNER_TEMP\winws2-smoke"
+          #
+          # PARENT DIR DELIBERATELY contains spaces + parentheses ("z2w (smoke)")
+          # to reproduce the user-reported crash class: cygwin1.dll's path_conv
+          # SIGSEGVs on paths like `C:\Program Files (x86)\z2w\` when fed
+          # long-form. We then launch winws2 via GetShortPathName-style
+          # invocation (same as production z2k_gui.py:start) — if a future
+          # change regresses the short-path handling, this test fails before
+          # the release ships.
+          $stage = "$env:RUNNER_TEMP\z2w (smoke)\winws2"
           New-Item -ItemType Directory -Force $stage | Out-Null
           Copy-Item winws2.exe, cygwin1.dll, WinDivert.dll, WinDivert64.sys $stage
           Copy-Item -Recurse lua, files, hostlists, windivert.filter $stage -ErrorAction SilentlyContinue
@@ -181,8 +189,19 @@ jobs:
           # /bin/sh-like helper. Reproduces production: standalone bundle
           # with nothing on PATH.
           $env:PATH = "$env:SystemRoot\system32;$env:SystemRoot"
+
+          # Resolve the staging path to its 8.3 short form before passing
+          # to winws2 — mirrors production behaviour (see _short_path() in
+          # z2k_gui.py). If 8.3 names happen to be disabled on the runner
+          # volume, GetShortPathName returns the long path verbatim and we
+          # fall back to exercising the paren-bearing path directly, which
+          # is also a useful signal.
+          $shortStage = (New-Object -ComObject Scripting.FileSystemObject).GetFolder($stage).ShortPath
+          Write-Host "Stage (long)  : $stage"
+          Write-Host "Stage (short) : $shortStage"
+
           Write-Host "Running winws2 --dry-run via @config from minimal bundle..."
-          Push-Location $stage
+          Push-Location $shortStage
           try {
             & .\winws2.exe "@cache/winws2.smoke.conf"
             $rc = $LASTEXITCODE
