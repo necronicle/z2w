@@ -43,6 +43,8 @@ WINWS_LOG_OLD    = SCRIPT_DIR / "z2w-winws.log.1"    # previous rotation
 WINWS_LOG_CAP    = 2 * 1024 * 1024                   # 2 MB per file
 TG_LOG_FILE      = SCRIPT_DIR / "z2w-tg.log"
 TG_LOG_OLD       = SCRIPT_DIR / "z2w-tg.log.1"
+CUSTOM_D_DIR     = SCRIPT_DIR / "custom.d"                     # backup-strategy .txt fragments
+CUSTOM_D_FLAG    = SCRIPT_DIR / "cache" / "custom_d_enabled.flag"  # persists toggle across restarts
 
 # winws2 config_from_file() uses static buf[MAX_CONFIG_FILE_SIZE] minus a
 # 3-byte preamble ("x " fake argv[0] + NUL). Fork bumped this define to 65536
@@ -70,7 +72,7 @@ TG_STDERR_FAIL_MARKERS  = (
     "fatal error:", "panic:",
 )
 
-VERSION = "1.4.2"
+VERSION = "1.4.3"
 
 _UNBLOCK_NAMES = [
     "winws2.exe", "cygwin1.dll", "WinDivert.dll", "WinDivert64.sys",
@@ -168,7 +170,43 @@ def _kill_stale(image: str) -> None:
     except Exception:
         pass
 
-def _write_winws_config() -> Path:
+def _read_custom_d_args() -> list[str]:
+    """Collect winws2 arg fragments from every ``*.txt`` file under
+    ``custom.d/``.
+
+    Each file is a free-form text fragment (comments + blank lines + arg
+    tokens). We strip comments, splice the rest on whitespace, and return
+    a flat token list. Files are sorted lexicographically so that the
+    ``NN-`` numeric prefix (mirroring upstream's ``50-discord-media``,
+    ``50-stun4all``) controls ordering.
+
+    Each file should end with ``--new`` so it becomes a self-contained
+    winws2 profile block — the caller splices these tokens in BEFORE
+    profiles.default.txt content, so custom.d profiles win on the
+    narrow filters they declare while the default profiles still cover
+    everything else.
+    """
+    if not CUSTOM_D_DIR.exists():
+        return []
+    tokens: list[str] = []
+    for path in sorted(CUSTOM_D_DIR.glob("*.txt")):
+        with path.open(encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                tokens.extend(line.split())
+    return tokens
+
+
+def _custom_d_available() -> bool:
+    """True iff at least one usable ``*.txt`` fragment exists. Used by the
+    UI to decide whether to render the toggle row at all — packaging may
+    or may not ship custom.d (advanced users edit/extend it themselves)."""
+    return bool(_read_custom_d_args())
+
+
+def _write_winws_config(custom_d_enabled: bool = False) -> Path:
     """Compose BASE_ARGS + profiles into a runtime config file that winws2
     reads via the @<config_file> CLI syntax.
 
@@ -191,6 +229,13 @@ def _write_winws_config() -> Path:
     WINWS_CONF_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     args: list[str] = list(BASE_ARGS)
+    # custom.d profiles go BEFORE the default ones so the narrow
+    # (port-range, payload-magic) filters they declare take priority over
+    # the wider z2k autocircular profile that would otherwise swallow the
+    # same packets. winws2 walks profile blocks in declaration order and
+    # uses the first whose filter matches.
+    if custom_d_enabled:
+        args.extend(_read_custom_d_args())
     with open(PROFILES, encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
@@ -560,6 +605,7 @@ class Api:
         self.tg_proc: subprocess.Popen | None = None
         self.tg_stderr_drain: _StderrDrain | None = None
         self.tg_enabled = TG_ENABLED_FLAG.exists()   # persisted across z2w restarts
+        self.custom_d_enabled = CUSTOM_D_FLAG.exists()   # persisted across z2w restarts
         self.tg_want_running = False                  # tracks user intent for watchdog
         self.tg_watchdog_thread: threading.Thread | None = None
         self.tg_probe_failures = 0
@@ -586,12 +632,14 @@ class Api:
             threading.Thread(target=self._tg_start, daemon=True,
                              name="tg-autostart").start()
         return {
-            "version":      VERSION,
-            "running":      self.running,
-            "tg_available": TG_PROXY_EXE.exists(),
-            "tg_enabled":   self.tg_enabled,
-            "tg_running":   self._tg_alive(),
-            "rkn_silent":   RKN_SILENT_FLAG.exists(),
+            "version":           VERSION,
+            "running":           self.running,
+            "tg_available":      TG_PROXY_EXE.exists(),
+            "tg_enabled":        self.tg_enabled,
+            "tg_running":        self._tg_alive(),
+            "rkn_silent":        RKN_SILENT_FLAG.exists(),
+            "custom_d_available": _custom_d_available(),
+            "custom_d_enabled":  self.custom_d_enabled,
         }
 
     def start(self) -> dict:
@@ -600,7 +648,7 @@ class Api:
             _kill_stale("winws2.exe")
             _ensure_instagram_dns()
             _unblock_files()
-            conf_path = _write_winws_config()
+            conf_path = _write_winws_config(custom_d_enabled=self.custom_d_enabled)
 
             # All three paths handed to winws2 go through GetShortPathNameW —
             # see _short_path() docstring for the failure modes this prevents.
@@ -710,6 +758,30 @@ class Api:
             threading.Thread(target=self._tg_stop, daemon=True,
                              name="tg-stop").start()
         return {"ok": True}
+
+    def set_custom_d_enabled(self, enabled: bool) -> dict:
+        """User toggled the custom.d (Discord/STUN backup) bundle.
+
+        Persisted via a flag file so the next z2w launch picks the same
+        state up — same mechanism as RKN silent fallback / TG enabled.
+        Takes effect on the NEXT winws2 (re)start: we don't restart it
+        on the toggle since the user may want to set this preference
+        before clicking Start. If winws2 is already running, the UI is
+        responsible for hinting that the toggle won't apply until
+        Stop → Start (handled in script.js)."""
+        self.custom_d_enabled = bool(enabled)
+        try:
+            CUSTOM_D_FLAG.parent.mkdir(parents=True, exist_ok=True)
+            if self.custom_d_enabled:
+                CUSTOM_D_FLAG.write_text("1", encoding="utf-8")
+            else:
+                try:
+                    CUSTOM_D_FLAG.unlink()
+                except FileNotFoundError:
+                    pass
+        except OSError:
+            pass
+        return {"ok": True, "running": self.running}
 
     def set_rkn_silent(self, enabled: bool) -> dict:
         RKN_SILENT_FLAG.parent.mkdir(parents=True, exist_ok=True)

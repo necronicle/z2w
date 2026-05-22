@@ -1,0 +1,14 @@
+# Port of bol-van/zapret2 init.d/custom.d.examples.linux/50-stun4all
+#
+# Any UDP packet that looks like a STUN request: payload length >= 28,
+# bytes 4..7 == 0x2112A442 (STUN magic cookie), and the message-type
+# header bits indicate request (not indication/response). Matched on the
+# WinDivert side by
+#   windivert.filter/windivert_part.stun.txt
+# so the filter side is already wired into BASE_ARGS.
+#
+# This file contributes ONE winws2 --new profile block running the
+# bol-van backup strategy (fake zeroed payload, repeats=2) for ALL STUN
+# requests. Placed before the default stun fall-through profile so the
+# desync is actually applied rather than being a pass-through.
+--filter-udp=1024-65535 --filter-l7=stun --payload=stun --lua-desync=fake:blob=0x00000000000000000000000000000000:repeats=2 --new

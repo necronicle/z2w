@@ -12,13 +12,16 @@
   const tgToggle     = $("tg-toggle");
   const tgSub        = $("tg-sub");
   const rknToggle    = $("rkn-toggle");
+  const customDToggle = $("custom-d-toggle");
+  const customDSub   = $("custom-d-sub");
   const errorBox     = $("error");
   const verLabel     = $("ver");
   const wcMin        = $("wc-min");
   const wcClose      = $("wc-close");
 
-  const tgRow  = tgToggle.closest(".row");
-  const rknRow = rknToggle.closest(".row");
+  const tgRow       = tgToggle.closest(".row");
+  const rknRow      = rknToggle.closest(".row");
+  const customDRow  = customDToggle.closest(".row");
 
   let startedAt = null;
   let uptimeTimer = null;
@@ -163,6 +166,20 @@
     await call("set_rkn_silent", rknToggle.checked);
   });
 
+  // ── custom.d toggle ───────────────────────────────────────
+  // Persisted on disk; applies on next winws2 (re)start. If winws2 is
+  // already running, surface a hint to restart so the user knows the
+  // setting is queued, not silently ignored.
+  const CUSTOM_D_DEFAULT_SUB = customDSub.textContent;
+  customDToggle.addEventListener("change", async () => {
+    const res = await call("set_custom_d_enabled", customDToggle.checked);
+    if (res && res.running) {
+      customDSub.textContent = "Применится после перезапуска (выключи и включи питание)";
+    } else {
+      customDSub.textContent = CUSTOM_D_DEFAULT_SUB;
+    }
+  });
+
   wcMin.addEventListener("click", () => call("minimize"));
   wcClose.addEventListener("click", () => call("close"));
 
@@ -193,6 +210,13 @@
       }
     }
     if (st && st.rkn_silent) rknToggle.checked = true;
+    if (st && !st.custom_d_available) {
+      customDRow.classList.add("is-disabled");
+      customDSub.textContent = "Папка custom.d отсутствует или пуста";
+      customDToggle.disabled = true;
+    } else if (st && st.custom_d_enabled) {
+      customDToggle.checked = true;
+    }
     if (st && st.running) {
       startedAt = Date.now();
       setState("on");

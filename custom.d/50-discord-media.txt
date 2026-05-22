@@ -1,0 +1,16 @@
+# Port of bol-van/zapret2 init.d/custom.d.examples.linux/50-discord-media
+#
+# Discord voice/video media UDP packets — port range 50000-50099. The
+# fingerprint that the upstream nft rule matches on (udp.length == 82,
+# first u32 == 0x00010046, then 64 bytes of zero — Discord's IP-discovery
+# packet shape) is already captured by our windivert filter at
+#   windivert.filter/windivert_part.discord_media.txt
+# so the filter side is wired up via the global --wf-raw-part in BASE_ARGS.
+#
+# This file contributes ONE winws2 --new profile block that runs the
+# bol-van backup strategy (fake zeroed payload, repeats=2) against
+# Discord media. We deliberately put this profile BEFORE the default
+# z2k discord_voice autocircular profile in cache/winws2.conf so it
+# wins on the narrow 50000-50099 range; the autocircular profile still
+# covers the wider port set (1400, 3478-3481, 5349, 19294-19344).
+--filter-udp=50000-50099 --filter-l7=discord --payload=discord_ip_discovery --lua-desync=fake:blob=0x00000000000000000000000000000000:repeats=2 --new
