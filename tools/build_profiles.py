@@ -271,7 +271,45 @@ def build_yt_quic() -> str:
 
 
 def build_discord_udp() -> str:
-    s = parse_quic_ini("discord_voice_autocircular")
+    """Discord UDP — verbatim port of config_official.sh:119.
+
+    Upstream's default Discord profile changed in z2k @2638ef8: dropped the
+    12-strategy quic_strats.ini:discord_voice_autocircular variant
+    (key=discord_voice) in favour of this 6-strategy inline one with
+    key=discord_udp + quic_dbankcloud blob. Two reasons:
+
+    * fingerprint diversity — TSPU was matching the Google-QUIC ClientHello
+      that quic_strats.ini's fake blobs leaned on; dbankcloud blob passes
+      the inspection (field consensus 2026-04-30).
+    * orchestrator removal — locked.lua / orchestra/ deleted upstream
+      2026-05-07; allow_nohost=1 on this profile replaces it. Discord UDP
+      handshake without SNI now flips track.hostname → "nohost" sentinel,
+      so circular sees a stable per-askey rotation state instead of
+      per-IP host_ip fallback. See z2k-autocircular.lua nohost_setup/restore.
+
+    Pinning key is now ``discord_udp`` (not ``discord_voice``) — different
+    namespace in state.tsv so the rotator state survives a switch between
+    the 6-strat and 12-strat templates if a future user opts in via
+    custom.d. strip_dead_range_args + ensure_circular_nld2 mirror the
+    upstream pipeline (config_official.sh:251, 811) — both are no-ops on
+    this string since nld=2 and per-strategy out_range are already in
+    canonical form, but keeping the calls keeps the parity audit obvious.
+    """
+    s = (
+        "--filter-udp=50000-50099,1400,3478-3481,5349,19294-19344 "
+        "--filter-l7=discord,stun "
+        "--in-range=-d100 --out-range=-d100 "
+        "--payload=quic_initial,discord_ip_discovery "
+        "--lua-desync=circular:fails=3:time=60:udp_in=1:udp_out=4"
+            ":key=discord_udp:nld=2:allow_nohost=1 "
+        "--lua-desync=fake:payload=all:blob=quic_dbankcloud:repeats=6:strategy=1 "
+        "--lua-desync=fake:payload=all:blob=quic_dbankcloud:repeats=4:strategy=2 "
+        "--lua-desync=fake:payload=all:blob=quic_dbankcloud:repeats=8:strategy=3 "
+        "--lua-desync=fake:payload=all:blob=quic_dbankcloud:repeats=6"
+            ":ip_autottl=-2,3-20:strategy=4 "
+        "--lua-desync=fake:payload=all:blob=fake_default_quic:repeats=6:strategy=5 "
+        "--lua-desync=fake:payload=all:blob=quic5:repeats=6:strategy=6"
+    )
     s = ensure_circular_nld2(s)
     s = strip_dead_range_args(s)
     return f"{s} --new"
